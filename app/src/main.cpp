@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 8 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 9 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 8: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 9: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -62,6 +62,7 @@ static const char* SYM_GB_UNLOCK   = "_ZN7android13GraphicBuffer6unlockEv";
 static const char* SYM_REGION_CTOR = "_ZN7android6RegionC1Ev";
 static const char* SYM_REGION_DTOR = "_ZN7android6RegionD1Ev";
 static const char* SYM_FENCE_NOF   = "_ZN7android5Fence8NO_FENCEE"; // sp<Fence> Fence::NO_FENCE
+static const char* SYM_INCSTRONG   = "_ZNK7android7RefBase9incStrongEPKv"; // RefBase::incStrong(void const*)
 
 // ---- FFI tipy ----
 using FnFactory    = void*  (*)();
@@ -82,6 +83,7 @@ using FnGppCancel  = int    (*)(void* thiz, int slot, const Sp* fence);
 using FnGbLock     = int    (*)(void* thiz, uint32_t usage, const void* rect, void** vaddr, int* obpp, int* obps);
 using FnGbUnlock   = int    (*)(void* thiz);
 using FnRegionCtor = void   (*)(void* thiz);
+using FnIncStrong  = void   (*)(const void* thiz, const void* id);
 
 // ---- krash-gard ----
 static sigjmp_buf g_jmp;
@@ -124,7 +126,7 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 8) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 9) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -167,6 +169,7 @@ int main(int argc, char** argv) {
     if (!noFenceSp) noFenceSp = dlsym(RTLD_DEFAULT, SYM_FENCE_NOF);
     void* g_noFence = noFenceSp ? *(void**)noFenceSp : nullptr;
     LOG("[S1] Fence::NO_FENCE sp=%p fence=%p", noFenceSp, g_noFence);
+    auto incStrong = sym<FnIncStrong>(SYM_INCSTRONG);
     void* vtSession    = dlsym(g_lib, SYM_VT_SESSION);
     void* vtComponent  = dlsym(g_lib, SYM_VT_COMPONENT);
     void* vtProducer   = dlsym(g_lib, SYM_VT_PRODUCER);
@@ -209,6 +212,9 @@ int main(int argc, char** argv) {
                 bic = calloc(1, 16384);   // ConsumerBase+BufferItemConsumer, s zapasom
                 bicCtor(bic, &outCons, /*usage*/0, /*bufCount*/8, /*controlledByApp*/false);
                 LOG("[S3] BufferItemConsumer sozdan @%p (drenazh ocheredi)", bic);
+                // KRITICHNO: BufferQueue derzhit consumer tolko slaboj ssylkoj (wp<>).
+                // Bez sobstvennoj silnoj ssylki RefBase unichtozhitsya -> ochered abandoned.
+                if (incStrong) { incStrong(bic, bic); LOG("[S3] incStrong(bic) - silnaya ssylka vzyata"); }
                 if (cbSetSize) { int r1 = cbSetSize(bic, (uint32_t)W, (uint32_t)H); LOG("[S3b] setDefaultBufferSize(%d,%d) rc=%d", W, H, r1); }
                 if (cbSetFmt)  { int r2 = cbSetFmt(bic, 1 /*RGBA_8888*/);            LOG("[S3b] setDefaultBufferFormat(RGBA_8888) rc=%d", r2); }
             }
