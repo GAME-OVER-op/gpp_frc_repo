@@ -1,52 +1,55 @@
 # gpp-frc-test
 
-Стенд для запуска фреймген-движка RedMagic OS (G-FRC+ / MotionEngine Vulkan) на кастоме.
-Сборка идёт в **GitHub Actions** с Android NDK — локальный компилятор не нужен.
+Stend dlya zapuska frejmgen-dvizhka RedMagic OS (G-FRC+ / MotionEngine Vulkan) na kastome.
+Sborka idyot v **GitHub Actions** s Android NDK - lokalnyj kompilyator ne nuzhen.
 
-## Что делает Phase 1
+## Phase 2 - podacha kadrov
 
-`gpp_frc_test` в реальном процессе на телефоне:
-1. загружает `libgppvppgfrcplussession.so` (и её зависимости) через `dlopen`;
-2. разрешает ключевые символы: `CreateFactory`, `GPPSession::GPPSession()`,
-   `GPPSession::connect(...)`, `GPPSession::createQueue(...)`, `GPPComponent::init/config`;
-3. безопасно вызывает `CreateFactory()` и печатает результат.
+`gpp_frc_test` v realnom processe na telefone:
+1. `dlopen` dvizhka `libgppvppgfrcplussession.so` + razreshenie tochnyh simvolov
+   (`CreateFactory`, `GPPSession::GPPSession/connect`, `Surface::Surface/getIGraphicBufferProducer`);
+2. **S2** dyorgaet `CreateFactory()` i opredelyaet klass vozvrashyonnogo obyekta po vtable;
+3. **S3** sozdayot `AImageReader` (vyhodnoj priyomnik) i beryot ego `IGraphicBufferProducer`;
+4. **S4** sozdayot `GPPSession`;
+5. **S5** zovyot `GPPSession::connect(pkg, layer, output, &input)` - poluchaet vhodnoj producer;
+6. **S6** oborachivaet vhodnoj producer v `Surface`;
+7. **S7** gonit ~150 animirovannyh RGBA-kadrov v vhod (~60 fps);
+8. **S8** best-effort zabiraet vyhodnye kadry iz `AImageReader` v `/data/local/tmp/gpp_out_*.bin`.
 
-Цель этого этапа — подтвердить, что движок достижим и сессию можно создать
-без демона и без игры. Phase 2 добавит подачу кадров (BufferQueue) и захват выхода.
+Kazhdaya stadiya pod zashitoj ot krasha (SIGSEGV/SIGABRT/SIGBUS -> log + perehod dalshe),
+poetomu lyuboj sboj ostavlyaet log do tochki padeniya (vidno nomer stadii).
 
-## Как собрать
+**Priznak uspeha** - v logcat poyavlyayutsya stroki dvizhka:
+`create BufferQueue done`, `FRC will do Nx interpolation`, `Send the Non-Interpolated frame`,
+logi MotionEngine/VTxr.
 
-1. Создай новый репозиторий на GitHub и залей туда содержимое этого архива:
+## Kak sobrat
+
+1. Sozdaj novyj repozitorij na GitHub i zalej tuda soderzhimoe etogo arhiva:
    ```bash
-   git init && git add . && git commit -m "phase 1"
+   git init && git add . && git commit -m "phase 2"
    git branch -M main
-   git remote add origin git@github.com:<ты>/gpp-frc-test.git
+   git remote add origin git@github.com:<ty>/gpp-frc-test.git
    git push -u origin main
    ```
-2. Открой вкладку **Actions** — сборка запустится автоматически.
-3. Скачай артефакт **gpp_frc_test-arm64-v8a**.
+2. Otkroj vkladku **Actions** - sborka zapustitsya avtomaticheski.
+3. Skachaj artefakt **gpp_frc_test-arm64-v8a**.
 
-## Как запустить на устройстве
+## Kak zapustit na ustrojstve
 
-```bash
-adb push gpp_frc_test /data/local/tmp/
-adb shell
-su
-chmod 755 /data/local/tmp/gpp_frc_test
-LD_LIBRARY_PATH=/data/adb/modules/gpp_frc_framegen/system/lib64:/system/lib64:/vendor/lib64 \
-  /data/local/tmp/gpp_frc_test --call-factory
+Polozhi `gpp_frc_test` i `run.sh` v odnu papku (naprimer `/data/local/tmp/`) i:
+```sh
+sh run.sh            # 150 kadrov, sam podnimet root
+sh run.sh 300        # 300 kadrov
 ```
+Skript sam sbrosit logcat, zapustit binar i soberyot:
+`*.log` (stdout), `*.log.full` (ves logcat), `*.log.gpp` (otfiltrovannye GPP/FRC stroki).
+Skinь mne `.log` i `.log.gpp`.
 
-Параллельно смотри логи:
-```bash
-adb logcat -s GPP_FRC_TEST GPP-Session GPPSession VTxr MotionEngine
+## Struktura
 ```
-
-Скинь весь вывод — по нему я соберу Phase 2 (подача тестовых кадров + захват результата).
-
-## Структура
-```
-.github/workflows/build.yml   — CI: NDK → arm64-v8a → артефакт
-app/CMakeLists.txt            — сборка
-app/src/main.cpp              — Phase 1 проба
+.github/workflows/build.yml   - CI: NDK -> arm64-v8a -> artefakt
+app/CMakeLists.txt            - sborka (NDK: log dl mediandk android nativewindow)
+app/src/main.cpp              - Phase 2 harness
+run.sh                        - zapusk na ustrojstve + zahvat logov
 ```

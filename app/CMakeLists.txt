@@ -6,8 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(gpp_frc_test src/main.cpp)
 
-# Phase 1 использует только NDK-либы (всё остальное через dlopen/dlsym на устройстве)
-target_link_libraries(gpp_frc_test log dl)
+# Phase 2: session/gui тянем через dlopen/dlsym на устройстве.
+# Линкуем только NDK-API, которые зовём напрямую:
+#   log        - __android_log_print
+#   dl         - dlopen/dlsym
+#   mediandk   - AImageReader_* / AImage_*
+#   android    - ANativeWindow_* (NDK surface API)
+#   nativewindow - ANativeWindow_* (на новых NDK вынесено сюда)
+target_link_libraries(gpp_frc_test log dl mediandk android nativewindow)
 
-# PIE-исполняемый (NDK делает это по умолчанию, но фиксируем явно)
 set_target_properties(gpp_frc_test PROPERTIES POSITION_INDEPENDENT_CODE ON)
