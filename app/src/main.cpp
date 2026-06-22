@@ -1,9 +1,14 @@
-// GPP-FRC standalone harness - Phase 2 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 3 (podacha kadrov cherez GPPSession::connect)
 //
-// Ideya: sozdayom GPPSession, dayom emu vyhodnoj producer ot AImageReader,
-// poluchaem vhodnoj producer, oborachivaem v Surface i gonim animirovannyj
-// test-pattern. Uspeh = v logcat poyavlyayutsya logi generacii kadrov
-// ("create BufferQueue done", "FRC will do Nx interpolation", "Send the Non-Interpolated frame").
+// Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
+// AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
+// a napryamuyu cherez BufferQueue::createBufferQueue (chistyj ABI: rezultaty
+// cherez out-parametry sp<>*, bez vozvrata struktury po znacheniyu i bez kastov).
+// K vyhodnomu konsumeru veshaem BufferItemConsumer, chtoby ochered ne perepolnyalas
+// i dvizhok mog otdat neskolko kadrov.
+//
+// Uspeh = v logcat poyavlyayutsya logi generacii kadrov:
+//   "create BufferQueue done", "FRC will do Nx interpolation", "Send the Non-Interpolated frame".
 //
 // Vsyo vneshnee tyanetsya cherez dlopen/dlsym (libgui ne linkuetsya).
 // sp<T> predstavlen kak {void* p}; vozvrat sp po znacheniyu - cherez sret-tryuk (SpRet).
@@ -30,15 +35,19 @@
 struct Sp { void* p = nullptr; };          // peredayotsya po ssylke/ukazatelyu
 struct SpRet { void* p; ~SpRet() {} };     // netrivialnyj dtor => vozvrat cherez pamyat (x8)
 
-// ---- tochnye mangled-imena ----
+// ---- tochnye mangled-imena (engine) ----
 static const char* SYM_CREATE_FACTORY = "CreateFactory";
 static const char* SYM_SESS_CTOR      = "_ZN7android10GPPSessionC1Ev";
 static const char* SYM_SESS_CONNECT   = "_ZN7android10GPPSession7connectERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_RKNS_2spINS_22IGraphicBufferProducerEEEPSC_";
-static const char* SYM_SURFACE_CTOR   = "_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEbRKNS1_INS_7IBinderEEE";
-static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBufferProducerEv";
 static const char* SYM_VT_SESSION     = "_ZTVN7android10GPPSessionE";
 static const char* SYM_VT_COMPONENT   = "_ZTVN7android12GPPComponentE";
 static const char* SYM_VT_PRODUCER    = "_ZTVN7android11GPPProducerE";
+
+// ---- tochnye mangled-imena (libgui) ----
+static const char* SYM_SURFACE_CTOR   = "_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEbRKNS1_INS_7IBinderEEE";
+static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBufferProducerEv";
+static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
+static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
 // ---- FFI tipy ----
 using FnFactory    = void*  (*)();
@@ -46,7 +55,9 @@ using FnSessCtor   = void   (*)(void* thiz);
 using FnConnect    = long   (*)(void* thiz, const std::string* a, const std::string* b,
                                 const Sp* outGbp, Sp* inGbp);
 using FnSurfCtor   = void   (*)(void* thiz, const Sp* gbp, bool controlledByApp, const Sp* sc);
-using FnSurfGetGbp = SpRet  (*)(void* thiz);   // const metod
+using FnSurfGetGbp = SpRet  (*)(void* thiz);   // const metod (fallback)
+using FnCreateBQ   = void   (*)(Sp* outProd, Sp* outCons, bool consumerIsSurfaceFlinger);
+using FnBicCtor    = void   (*)(void* thiz, const Sp* cons, uint64_t usage, int bufCount, bool controlledByApp);
 
 // ---- krash-gard ----
 static sigjmp_buf g_jmp;
@@ -88,7 +99,7 @@ static void draw_frame(ANativeWindow_Buffer* b, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 2) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 3) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -105,18 +116,22 @@ int main(int argc, char** argv) {
         if (g_lib) break;
     }
     if (!g_lib) { LOG("FATAL: net session-liby"); return 1; }
+    // podtyanut libgui v globalnyj scope (na sluchaj, esli ne podtyanulas tranzitivno)
+    dlopen("libgui.so", RTLD_NOW | RTLD_GLOBAL);
 
     auto createFactory = sym<FnFactory>(SYM_CREATE_FACTORY);
     auto sessCtor      = sym<FnSessCtor>(SYM_SESS_CTOR);
     auto sessConnect   = sym<FnConnect>(SYM_SESS_CONNECT);
     auto surfCtor      = sym<FnSurfCtor>(SYM_SURFACE_CTOR);
     auto surfGetGbp    = sym<FnSurfGetGbp>(SYM_SURF_GETIGBP);
+    auto createBQ      = sym<FnCreateBQ>(SYM_CREATE_BQ);
+    auto bicCtor       = sym<FnBicCtor>(SYM_BIC_CTOR);
     void* vtSession    = dlsym(g_lib, SYM_VT_SESSION);
     void* vtComponent  = dlsym(g_lib, SYM_VT_COMPONENT);
     void* vtProducer   = dlsym(g_lib, SYM_VT_PRODUCER);
     LOG("[S1] vtable GPPSession=%p GPPComponent=%p GPPProducer=%p", vtSession, vtComponent, vtProducer);
 
-    if (!sessCtor || !sessConnect || !surfCtor || !surfGetGbp) {
+    if (!sessCtor || !sessConnect || !surfCtor) {
         LOG("FATAL: ne vse klyuchevye simvoly razresheny"); return 1;
     }
 
@@ -140,24 +155,36 @@ int main(int argc, char** argv) {
         }
     } else { LOG("[S2] upalo na CreateFactory"); }
 
-    // -------- S3: AImageReader na vyhod --------
+    // -------- S3: vyhodnoj producer cherez BufferQueue::createBufferQueue --------
     g_stage = 3;
-    AImageReader* reader = nullptr;
-    ANativeWindow* outWin = nullptr;
-    Sp outGbp;
+    Sp outGbp;          // vyhodnoj IGraphicBufferProducer (dlya connect)
+    Sp outCons;         // vyhodnoj IGraphicBufferConsumer
+    void* bic = nullptr;
     if (sigsetjmp(g_jmp, 1) == 0) {
-        media_status_t ms = AImageReader_new(W, H, AIMAGE_FORMAT_RGBA_8888, 8, &reader);
-        LOG("[S3] AImageReader_new -> %d, reader=%p", ms, reader);
-        if (reader) {
-            AImageReader_getWindow(reader, &outWin);
-            LOG("[S3] outWin(Surface*)=%p", outWin);
-            if (outWin) {
-                SpRet r = surfGetGbp((void*)outWin);
-                outGbp.p = r.p;
-                LOG("[S3] outGbp(IGraphicBufferProducer*)=%p", outGbp.p);
+        if (createBQ) {
+            createBQ(&outGbp, &outCons, false);
+            LOG("[S3] createBufferQueue -> prod=%p cons=%p", outGbp.p, outCons.p);
+            if (outCons.p && bicCtor) {
+                bic = calloc(1, 16384);   // ConsumerBase+BufferItemConsumer, s zapasom
+                bicCtor(bic, &outCons, /*usage*/0, /*bufCount*/8, /*controlledByApp*/false);
+                LOG("[S3] BufferItemConsumer sozdan @%p (drenazh ocheredi)", bic);
             }
         }
-    } else { LOG("[S3] upalo na AImageReader/getIGBP"); }
+    } else { LOG("[S3] upalo na createBufferQueue/BufferItemConsumer"); }
+
+    // fallback: staryj put cherez AImageReader (esli createBufferQueue nedostupen)
+    if (!outGbp.p) {
+        if (sigsetjmp(g_jmp, 1) == 0) {
+            AImageReader* reader = nullptr; ANativeWindow* outWin = nullptr;
+            media_status_t ms = AImageReader_new(W, H, AIMAGE_FORMAT_RGBA_8888, 8, &reader);
+            LOG("[S3-fb] AImageReader_new -> %d, reader=%p", ms, reader);
+            if (reader) {
+                AImageReader_getWindow(reader, &outWin);
+                if (outWin && surfGetGbp) { SpRet r = surfGetGbp((void*)outWin); outGbp.p = r.p; }
+                LOG("[S3-fb] outGbp=%p", outGbp.p);
+            }
+        } else { LOG("[S3-fb] fallback tozhe upal"); }
+    }
     if (!outGbp.p) { LOG("FATAL: net vyhodnogo producer"); return 1; }
 
     // -------- S4: sozdat GPPSession --------
@@ -187,52 +214,26 @@ int main(int argc, char** argv) {
         void* surf = calloc(1, 8192);
         Sp nullBinder;
         surfCtor(surf, &inGbp, /*controlledByApp*/ true, &nullBinder);
-        inWin = (ANativeWindow*)surf;
-        LOG("[S6] input Surface @%p", inWin);
-        int rc = ANativeWindow_setBuffersGeometry(inWin, W, H, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
-        LOG("[S6] setBuffersGeometry rc=%d", rc);
-    } else { LOG("[S6] upalo na Surface/setGeometry"); return 1; }
+        inWin = (ANativeWindow*)surf;   // Surface : ANativeWindow (offset 0)
+        LOG("[S6] Surface(inGbp) @%p", inWin);
+        ANativeWindow_setBuffersGeometry(inWin, W, H, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
+    } else { LOG("[S6] upalo na Surface(inGbp)"); return 1; }
 
-    // -------- S7: gonim kadry --------
+    // -------- S7: gnat kadry vo vhodnoj producer --------
     g_stage = 7;
     int posted = 0;
-    if (sigsetjmp(g_jmp, 1) == 0) {
-        for (int i = 0; i < frames; ++i) {
-            ANativeWindow_Buffer buf;
-            int rc = ANativeWindow_lock(inWin, &buf, nullptr);
-            if (rc != 0) { LOG("[S7] lock rc=%d na kadre %d", rc, i); break; }
-            draw_frame(&buf, i);
-            ANativeWindow_unlockAndPost(inWin);
-            ++posted;
-            if (i % 30 == 0) LOG("[S7] podano kadrov: %d", posted);
-            usleep(16000);
-        }
-        LOG("[S7] VSEGO podano kadrov: %d", posted);
-    } else { LOG("[S7] upalo na podache kadrov (posle %d)", posted); }
-
-    // -------- S8: zabrat vyhod (best-effort) --------
-    g_stage = 8;
-    if (sigsetjmp(g_jmp, 1) == 0) {
-        sleep(1);
-        int saved = 0;
-        for (int k = 0; k < 8; ++k) {
-            AImage* img = nullptr;
-            media_status_t ms = AImageReader_acquireNextImage(reader, &img);
-            if (ms != AMEDIA_OK || !img) break;
-            int32_t fw = 0, fh = 0, fmt = 0;
-            AImage_getWidth(img, &fw); AImage_getHeight(img, &fh); AImage_getFormat(img, &fmt);
-            uint8_t* data = nullptr; int len = 0;
-            AImage_getPlaneData(img, 0, &data, &len);
-            char path[160];
-            snprintf(path, sizeof(path), "/data/local/tmp/gpp_out_%02d_%dx%d_fmt%d.bin", k, fw, fh, fmt);
-            FILE* f = fopen(path, "wb");
-            if (f && data && len > 0) { fwrite(data, 1, len, f); fclose(f); ++saved; LOG("[S8] sohranyon %s (%d bajt)", path, len); }
-            else if (f) fclose(f);
-            AImage_delete(img);
-        }
-        LOG("[S8] vyhodnyh kadrov zahvacheno: %d", saved);
-    } else { LOG("[S8] upalo na zahvate vyhoda"); }
-
-    LOG("=== done (sm. logcat: 'create BufferQueue done', 'FRC will do', 'Send the Non-Interpolated frame') ===");
+    for (int i = 0; i < frames; ++i) {
+        if (sigsetjmp(g_jmp, 1) != 0) { LOG("[S7] upalo na kadre %d", i); break; }
+        ANativeWindow_Buffer buf;
+        int rc = ANativeWindow_lock(inWin, &buf, nullptr);
+        if (rc != 0) { LOG("[S7] lock kadr %d rc=%d (ochered polna/abandoned?)", i, rc); usleep(16000); continue; }
+        draw_frame(&buf, i);
+        ANativeWindow_unlockAndPost(inWin);
+        ++posted;
+        if (i % 30 == 0) LOG("[S7] otdano kadrov: %d", posted);
+        usleep(16000);   // ~60 fps
+    }
+    LOG("[S7] vsego otdano kadrov: %d", posted);
+    LOG("=== gotovo. smotri logcat na stroki dvizhka (FRC/Interpolated/BufferQueue) ===");
     return 0;
 }

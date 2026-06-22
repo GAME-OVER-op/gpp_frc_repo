@@ -3,7 +3,7 @@
 Stend dlya zapuska frejmgen-dvizhka RedMagic OS (G-FRC+ / MotionEngine Vulkan) na kastome.
 Sborka idyot v **GitHub Actions** s Android NDK - lokalnyj kompilyator ne nuzhen.
 
-## Phase 2 - podacha kadrov
+## Phase 3 - podacha kadrov
 
 `gpp_frc_test` v realnom processe na telefone:
 1. `dlopen` dvizhka `libgppvppgfrcplussession.so` + razreshenie tochnyh simvolov
@@ -27,7 +27,7 @@ logi MotionEngine/VTxr.
 
 1. Sozdaj novyj repozitorij na GitHub i zalej tuda soderzhimoe etogo arhiva:
    ```bash
-   git init && git add . && git commit -m "phase 2"
+   git init && git add . && git commit -m "phase 3"
    git branch -M main
    git remote add origin git@github.com:<ty>/gpp-frc-test.git
    git push -u origin main
@@ -50,6 +50,6 @@ Skinь mne `.log` i `.log.gpp`.
 ```
 .github/workflows/build.yml   - CI: NDK -> arm64-v8a -> artefakt
 app/CMakeLists.txt            - sborka (NDK: log dl mediandk android nativewindow)
-app/src/main.cpp              - Phase 2 harness
+app/src/main.cpp              - Phase 3 harness
 run.sh                        - zapusk na ustrojstve + zahvat logov
 ```
