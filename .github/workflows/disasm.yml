@@ -1,0 +1,33 @@
+name: disasm
+
+on:
+  push:
+    paths:
+      - 'engine/**'
+      - 'tools/disasm.sh'
+      - '.github/workflows/disasm.yml'
+  workflow_dispatch:
+
+jobs:
+  disasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-objdump --version | head -1
+
+      - name: Disassemble engine
+        run: |
+          chmod +x tools/disasm.sh
+          ./tools/disasm.sh engine/libgppvppgfrcplussession.so disasm_out
+
+      - name: Upload disassembly
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpp-engine-disasm
+          path: disasm_out/
+          if-no-files-found: error
