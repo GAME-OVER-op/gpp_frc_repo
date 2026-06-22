@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 10 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 11 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 10: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 11: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -132,6 +132,8 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
 // RefBase = [vptr@0][weakref_impl* mRefs@8]; weakref_impl.mBase@16 ukazyvaet OBRATNO na RefBase.
 // Perebiraem smeshenie O i ishem gde back-pointer sovpadaet. Vse pod krash-gardom.
 static void* find_refbase(void* obj) {
+    // weakref_impl (release, BEZ vtable): mStrong@0, mWeak@4, mBase@8, mFlags@12.
+    // mBase ukazyvaet OBRATNO na RefBase. Proverim mBase po +8 i (debug) +16.
     for (int O = 0; O <= 512; O += 8) {
         g_probe_active = 1;
         if (sigsetjmp(g_jmp_probe, 1) != 0) { continue; }
@@ -139,15 +141,22 @@ static void* find_refbase(void* obj) {
         void* mRefs = *(void**)(rb + 8);
         uintptr_t m = (uintptr_t)mRefs;
         if (m < 0x10000 || (m & 0x7)) continue;
-        void* mBase = *(void**)((char*)mRefs + 16);
-        if (mBase == (void*)rb) { g_probe_active = 0; return (void*)rb; }
+        for (int mb = 8; mb <= 16; mb += 8) {
+            void* mBase = *(void**)((char*)mRefs + mb);
+            if (mBase == (void*)rb) {
+                int32_t st = *(int32_t*)mRefs;
+                g_probe_active = 0;
+                LOG("[S3] RefBase kandidat: O=+%d mBase@+%d mStrong=0x%x", O, mb, st);
+                return (void*)rb;
+            }
+        }
     }
     g_probe_active = 0;
     return nullptr;
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 10) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 11) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
