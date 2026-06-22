@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 5 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 6 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,6 +49,19 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
+// ---- Phase 6: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
+static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
+static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
+static const char* SYM_GPPP_DEQUEUE= "_ZN7android11GPPProducer13dequeueBufferEPiPNS_2spINS_5FenceEEEjjimPmPNS_22FrameEventHistoryDeltaE";
+static const char* SYM_GPPP_REQUEST= "_ZN7android11GPPProducer13requestBufferEiPNS_2spINS_13GraphicBufferEEE";
+static const char* SYM_GPPP_QUEUE  = "_ZN7android11GPPProducer11queueBufferEiRKNS_22IGraphicBufferProducer16QueueBufferInputEPNS1_17QueueBufferOutputE";
+static const char* SYM_GPPP_CANCEL = "_ZN7android11GPPProducer12cancelBufferEiRKNS_2spINS_5FenceEEE";
+static const char* SYM_GB_LOCK     = "_ZN7android13GraphicBuffer4lockEjPPv";
+static const char* SYM_GB_UNLOCK   = "_ZN7android13GraphicBuffer6unlockEv";
+static const char* SYM_REGION_CTOR = "_ZN7android6RegionC1Ev";
+static const char* SYM_REGION_DTOR = "_ZN7android6RegionD1Ev";
+
 // ---- FFI tipy ----
 using FnFactory    = void*  (*)();
 using FnSessCtor   = void   (*)(void* thiz);
@@ -58,6 +71,16 @@ using FnSurfCtor   = void   (*)(void* thiz, const Sp* gbp, bool controlledByApp,
 using FnSurfGetGbp = SpRet  (*)(void* thiz);   // const metod (fallback)
 using FnCreateBQ   = void   (*)(Sp* outProd, Sp* outCons, bool consumerIsSurfaceFlinger);
 using FnBicCtor    = void   (*)(void* thiz, const Sp* cons, uint64_t usage, int bufCount, bool controlledByApp);
+using FnCBSize     = int    (*)(void* thiz, uint32_t w, uint32_t h);
+using FnCBFmt      = int    (*)(void* thiz, int fmt);
+using FnGppConnect = int    (*)(void* thiz, const Sp* listener, int api, bool controlledByApp, void* qbo);
+using FnGppDequeue = int    (*)(void* thiz, int* slot, Sp* fence, uint32_t w, uint32_t h, int fmt, uint64_t usage, uint64_t* age, void* outTs);
+using FnGppRequest = int    (*)(void* thiz, int slot, Sp* gbOut);
+using FnGppQueue   = int    (*)(void* thiz, int slot, const void* qbi, void* qbo);
+using FnGppCancel  = int    (*)(void* thiz, int slot, const Sp* fence);
+using FnGbLock     = int    (*)(void* thiz, uint32_t usage, void** vaddr);
+using FnGbUnlock   = int    (*)(void* thiz);
+using FnRegionCtor = void   (*)(void* thiz);
 
 // ---- krash-gard ----
 static sigjmp_buf g_jmp;
@@ -71,6 +94,7 @@ static void on_sig(int s) {
 static void* g_lib = nullptr;
 template <class T> static T sym(const char* n) {
     void* p = dlsym(g_lib, n);
+    if (!p) p = dlsym(RTLD_DEFAULT, n);
     LOG("  dlsym %.50s%s -> %p", n, strlen(n) > 50 ? "..." : "", p);
     return reinterpret_cast<T>(p);
 }
@@ -84,14 +108,14 @@ static const char* LIB_CANDIDATES[] = {
 
 static const int W = 1280, H = 720;
 
-// narisovat dvizhushijsya pryamougolnik v RGBA8888 bufer
-static void draw_frame(ANativeWindow_Buffer* b, int frame) {
-    uint8_t* base = (uint8_t*)b->bits;
-    int rx = (frame * 12) % (b->width  > 160 ? b->width  - 160 : 1);
-    int ry = (frame * 7)  % (b->height > 160 ? b->height - 160 : 1);
-    for (int y = 0; y < b->height; ++y) {
-        uint32_t* row = (uint32_t*)(base + (size_t)y * b->stride * 4);
-        for (int x = 0; x < b->width; ++x) {
+// narisovat dvizhushijsya pryamougolnik v RGBA8888 bufer (stride v pikselyah)
+static void draw_raw(void* bits, int w, int h, int stride, int frame) {
+    uint8_t* base = (uint8_t*)bits;
+    int rx = (frame * 12) % (w > 160 ? w - 160 : 1);
+    int ry = (frame * 7)  % (h > 160 ? h - 160 : 1);
+    for (int y = 0; y < h; ++y) {
+        uint32_t* row = (uint32_t*)(base + (size_t)y * stride * 4);
+        for (int x = 0; x < w; ++x) {
             bool in = (x >= rx && x < rx + 160 && y >= ry && y < ry + 160);
             row[x] = in ? 0xFF00FF00u : 0xFF202020u;
         }
@@ -99,7 +123,7 @@ static void draw_frame(ANativeWindow_Buffer* b, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 5) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 6) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -118,6 +142,7 @@ int main(int argc, char** argv) {
     if (!g_lib) { LOG("FATAL: net session-liby"); return 1; }
     // podtyanut libgui v globalnyj scope (na sluchaj, esli ne podtyanulas tranzitivno)
     dlopen("libgui.so", RTLD_NOW | RTLD_GLOBAL);
+    dlopen("libui.so", RTLD_NOW | RTLD_GLOBAL);
 
     auto createFactory = sym<FnFactory>(SYM_CREATE_FACTORY);
     auto sessCtor      = sym<FnSessCtor>(SYM_SESS_CTOR);
@@ -126,6 +151,17 @@ int main(int argc, char** argv) {
     auto surfGetGbp    = sym<FnSurfGetGbp>(SYM_SURF_GETIGBP);
     auto createBQ      = sym<FnCreateBQ>(SYM_CREATE_BQ);
     auto bicCtor       = sym<FnBicCtor>(SYM_BIC_CTOR);
+    auto cbSetSize     = sym<FnCBSize>(SYM_CB_SETSIZE);
+    auto cbSetFmt      = sym<FnCBFmt>(SYM_CB_SETFMT);
+    auto gppConnect    = sym<FnGppConnect>(SYM_GPPP_CONNECT);
+    auto gppDequeue    = sym<FnGppDequeue>(SYM_GPPP_DEQUEUE);
+    auto gppRequest    = sym<FnGppRequest>(SYM_GPPP_REQUEST);
+    auto gppQueue      = sym<FnGppQueue>(SYM_GPPP_QUEUE);
+    auto gppCancel     = sym<FnGppCancel>(SYM_GPPP_CANCEL);
+    auto gbLock        = sym<FnGbLock>(SYM_GB_LOCK);
+    auto gbUnlock      = sym<FnGbUnlock>(SYM_GB_UNLOCK);
+    auto regionCtor    = sym<FnRegionCtor>(SYM_REGION_CTOR);
+    auto regionDtor    = sym<FnRegionCtor>(SYM_REGION_DTOR);
     void* vtSession    = dlsym(g_lib, SYM_VT_SESSION);
     void* vtComponent  = dlsym(g_lib, SYM_VT_COMPONENT);
     void* vtProducer   = dlsym(g_lib, SYM_VT_PRODUCER);
@@ -168,6 +204,8 @@ int main(int argc, char** argv) {
                 bic = calloc(1, 16384);   // ConsumerBase+BufferItemConsumer, s zapasom
                 bicCtor(bic, &outCons, /*usage*/0, /*bufCount*/8, /*controlledByApp*/false);
                 LOG("[S3] BufferItemConsumer sozdan @%p (drenazh ocheredi)", bic);
+                if (cbSetSize) { int r1 = cbSetSize(bic, (uint32_t)W, (uint32_t)H); LOG("[S3b] setDefaultBufferSize(%d,%d) rc=%d", W, H, r1); }
+                if (cbSetFmt)  { int r2 = cbSetFmt(bic, 1 /*RGBA_8888*/);            LOG("[S3b] setDefaultBufferFormat(RGBA_8888) rc=%d", r2); }
             }
         }
     } else { LOG("[S3] upalo na createBufferQueue/BufferItemConsumer"); }
@@ -227,59 +265,83 @@ int main(int argc, char** argv) {
         if (!in20 || !out30) LOG("[S5b] VNIMANIE: inner-producer NULL -> connect ne dovyazal konvejer (nuzhen VPP HAL/configstore)");
     } else { LOG("[S5b] damp inner upal"); }
 
-    // -------- S6: obernut vhodnoj producer v Surface --------
+    // -------- S6: podklyuchitsya k vhodnomu producer NAPRYAMUYU (bez Surface) --------
+    // Surface-obyortka padala na NDK-dispetche (perform/query hooks). Gonim kadry
+    // pryamo v GPPProducer ego sobstvennymi metodami (connect/dequeue/request/queue).
     g_stage = 6;
-    ANativeWindow* inWin = nullptr;
+    bool connected = false;
     if (sigsetjmp(g_jmp, 1) == 0) {
-        void* surf = calloc(1, 8192);
-        Sp nullBinder;
-        surfCtor(surf, &inGbp, /*controlledByApp*/ true, &nullBinder);
-        inWin = (ANativeWindow*)surf;   // Surface : ANativeWindow (offset 0)
-        LOG("[S6] Surface(inGbp) ctor OK @%p", inWin);
-    } else { LOG("[S6] upalo na konstruktore Surface(inGbp)"); return 1; }
+        if (gppConnect) {
+            char qbo[256]; memset(qbo, 0, sizeof(qbo));
+            Sp nullListener;
+            int rc = gppConnect(inGbp.p, &nullListener, 2 /*NATIVE_WINDOW_API_CPU*/, true, qbo);
+            uint32_t qw = *(uint32_t*)(qbo + 0), qh = *(uint32_t*)(qbo + 4);
+            LOG("[S6] GPPProducer::connect(API_CPU) rc=%d  qbo w=%u h=%u", rc, qw, qh);
+            connected = (rc >= 0);
+        } else { LOG("[S6] net simvola GPPProducer::connect"); }
+    } else { LOG("[S6] GPPProducer::connect UPAL"); }
 
-    // -------- S6b: proba okna (ne fatalno) --------
-    g_stage = 6;
-    if (sigsetjmp(g_jmp, 1) == 0) {
-        int w = ANativeWindow_getWidth(inWin);
-        int h = ANativeWindow_getHeight(inWin);
-        int f = ANativeWindow_getFormat(inWin);
-        LOG("[S6b] okno do nastrojki: %dx%d format=%d", w, h, f);
-    } else { LOG("[S6b] query okna upal (ne fatalno)"); }
-
-    // -------- S6c: setBuffersGeometry (ne fatalno) --------
-    g_stage = 6;
-    bool geom_ok = false;
-    if (sigsetjmp(g_jmp, 1) == 0) {
-        int rc = ANativeWindow_setBuffersGeometry(inWin, W, H, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
-        LOG("[S6c] setBuffersGeometry rc=%d", rc);
-        geom_ok = (rc == 0);
-    } else { LOG("[S6c] setBuffersGeometry UPAL (perform-hook). Probuyem dalshe bez nego."); }
-
-    // -------- S7: gnat kadry vo vhodnoj producer (kazhdyj kadr pod gardom) --------
+    // -------- S7: dequeue -> request -> lock -> draw -> queue (per-kadr pod gardom) --------
     g_stage = 7;
-    int posted = 0, lockfail = 0;
+    void* gbslot[64]; memset(gbslot, 0, sizeof(gbslot));
+    int posted = 0, deqfail = 0; bool use_cancel = false;
+    const uint64_t USAGE = 0x33; // SW_READ_OFTEN | SW_WRITE_OFTEN
     for (int i = 0; i < frames; ++i) {
-        if (sigsetjmp(g_jmp, 1) != 0) {
-            LOG("[S7] SIGSEGV/ABRT na kadre %d (lock/post). Stop.", i);
-            break;
-        }
-        ANativeWindow_Buffer buf;
-        int rc = ANativeWindow_lock(inWin, &buf, nullptr);
-        if (rc != 0) {
-            LOG("[S7] lock kadr %d rc=%d", i, rc);
-            if (++lockfail >= 5) { LOG("[S7] 5 podryad neudachnyh lock -> stop"); break; }
+        if (sigsetjmp(g_jmp, 1) != 0) { LOG("[S7] signal na kadre %d -> stop", i); break; }
+        if (!gppDequeue) { LOG("[S7] net dequeueBuffer"); break; }
+        int slot = -1; Sp fence; uint64_t age = 0;
+        int rc = gppDequeue(inGbp.p, &slot, &fence, (uint32_t)W, (uint32_t)H, 1 /*RGBA_8888*/, USAGE, &age, nullptr);
+        if (i == 0 || rc < 0) LOG("[S7] dequeueBuffer kadr %d -> rc=%d slot=%d", i, rc, slot);
+        if (rc < 0 || slot < 0 || slot >= 64) {
+            if (++deqfail >= 5) { LOG("[S7] 5 neudachnyh dequeue -> stop"); break; }
             usleep(16000); continue;
         }
-        lockfail = 0;
-        if (posted == 0) LOG("[S7] pervyj lock OK: %dx%d stride=%d format=%d", buf.width, buf.height, buf.stride, buf.format);
-        draw_frame(&buf, i);
-        ANativeWindow_unlockAndPost(inWin);
-        ++posted;
-        if (i % 30 == 0) LOG("[S7] otdano kadrov: %d", posted);
-        usleep(16000);   // ~60 fps
+        deqfail = 0;
+        if ((rc & 1 /*BUFFER_NEEDS_REALLOCATION*/) || !gbslot[slot]) {
+            if (gppRequest) { Sp gb; int rr = gppRequest(inGbp.p, slot, &gb); gbslot[slot] = gb.p;
+                if (i == 0) LOG("[S7] requestBuffer slot=%d rc=%d gb=%p", slot, rr, gb.p); }
+        }
+        void* gb = gbslot[slot];
+        if (!gb) { LOG("[S7] net GraphicBuffer dlya slota %d", slot); break; }
+        // ANativeWindowBuffer: width@40, height@44, stride@48, format@52 (piksel-stride)
+        int gw = *(int*)((char*)gb + 40), gh = *(int*)((char*)gb + 44);
+        int gstride = *(int*)((char*)gb + 48), gfmt = *(int*)((char*)gb + 52);
+        if (i == 0) LOG("[S7] GraphicBuffer %dx%d stride=%d fmt=%d", gw, gh, gstride, gfmt);
+        int dw = (gw > 0 && gw <= 4096) ? gw : W;
+        int dh = (gh > 0 && gh <= 4096) ? gh : H;
+        int dstride = (gstride >= dw && gstride <= dw + 4096) ? gstride : dw;
+        void* vaddr = nullptr;
+        if (gbLock) {
+            int lr = gbLock(gb, (uint32_t)USAGE, &vaddr);
+            if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p", lr, vaddr);
+            if (lr == 0 && vaddr) { draw_raw(vaddr, dw, dh, dstride, i); if (gbUnlock) gbUnlock(gb); }
+        }
+        if (!use_cancel && gppQueue) {
+            char qbi[256]; memset(qbi, 0, sizeof(qbi));
+            *(int64_t*)(qbi + 0)   = 0;      // timestamp
+            *(int*)(qbi + 8)       = 1;      // isAutoTimestamp
+            *(int*)(qbi + 12)      = 0;      // dataSpace UNKNOWN
+            *(int*)(qbi + 16)      = 0;      // crop.left
+            *(int*)(qbi + 20)      = 0;      // crop.top
+            *(int*)(qbi + 24)      = W;      // crop.right
+            *(int*)(qbi + 28)      = H;      // crop.bottom
+            *(int*)(qbi + 32)      = 0;      // scalingMode
+            *(uint32_t*)(qbi + 36) = 0;      // transform
+            *(uint32_t*)(qbi + 40) = 0;      // stickyTransform
+            *(void**)(qbi + 48)    = nullptr;// fence sp<>
+            if (regionCtor) regionCtor(qbi + 56);   // surfaceDamage Region (nastoyaschij ctor)
+            char qboQ[256]; memset(qboQ, 0, sizeof(qboQ));
+            int qr = gppQueue(inGbp.p, slot, qbi, qboQ);
+            if (regionDtor) regionDtor(qbi + 56);
+            if (i == 0) LOG("[S7] queueBuffer slot=%d rc=%d", slot, qr);
+            if (qr < 0) { if (i == 0) LOG("[S7] queueBuffer oshibka -> perehozhu na cancelBuffer"); use_cancel = true; }
+            else ++posted;
+        }
+        if (use_cancel && gppCancel) { Sp nf; gppCancel(inGbp.p, slot, &nf); }
+        if (i % 30 == 0) LOG("[S7] kadr %d (otdano=%d, cancel=%d)", i, posted, use_cancel ? 1 : 0);
+        usleep(16000);
     }
-    LOG("[S7] vsego otdano kadrov: %d", posted);
-    LOG("=== gotovo. smotri logcat na stroki dvizhka (FRC/Interpolated/BufferQueue) ===");
+    LOG("[S7] vsego otdano kadrov dvizhku: %d", posted);
+    LOG("=== gotovo. smotri logcat: FRC/Interpolated/MotionEngine/BufferQueue ===");
     return 0;
 }
