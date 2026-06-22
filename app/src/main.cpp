@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 9 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 10 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 9: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 10: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -87,8 +87,11 @@ using FnIncStrong  = void   (*)(const void* thiz, const void* id);
 
 // ---- krash-gard ----
 static sigjmp_buf g_jmp;
+static sigjmp_buf g_jmp_probe;
+static volatile int g_probe_active = 0;
 static volatile int g_stage = 0;
 static void on_sig(int s) {
+    if (g_probe_active) { siglongjmp(g_jmp_probe, 1); }
     __android_log_print(ANDROID_LOG_ERROR, TAG, "!!! signal %d na stadii %d", s, g_stage);
     printf("!!! signal %d na stadii %d\n", s, g_stage); fflush(stdout);
     siglongjmp(g_jmp, 1);
@@ -125,8 +128,26 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
     }
 }
 
+// Najti podobjekt RefBase vnutri objekta s virtualnym nasledovaniem.
+// RefBase = [vptr@0][weakref_impl* mRefs@8]; weakref_impl.mBase@16 ukazyvaet OBRATNO na RefBase.
+// Perebiraem smeshenie O i ishem gde back-pointer sovpadaet. Vse pod krash-gardom.
+static void* find_refbase(void* obj) {
+    for (int O = 0; O <= 512; O += 8) {
+        g_probe_active = 1;
+        if (sigsetjmp(g_jmp_probe, 1) != 0) { continue; }
+        char* rb = (char*)obj + O;
+        void* mRefs = *(void**)(rb + 8);
+        uintptr_t m = (uintptr_t)mRefs;
+        if (m < 0x10000 || (m & 0x7)) continue;
+        void* mBase = *(void**)((char*)mRefs + 16);
+        if (mBase == (void*)rb) { g_probe_active = 0; return (void*)rb; }
+    }
+    g_probe_active = 0;
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 9) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 10) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -214,7 +235,16 @@ int main(int argc, char** argv) {
                 LOG("[S3] BufferItemConsumer sozdan @%p (drenazh ocheredi)", bic);
                 // KRITICHNO: BufferQueue derzhit consumer tolko slaboj ssylkoj (wp<>).
                 // Bez sobstvennoj silnoj ssylki RefBase unichtozhitsya -> ochered abandoned.
-                if (incStrong) { incStrong(bic, bic); LOG("[S3] incStrong(bic) - silnaya ssylka vzyata"); }
+                if (incStrong) {
+                    void* rb = find_refbase(bic);
+                    if (rb) {
+                        long off = (char*)rb - (char*)bic;
+                        incStrong(rb, rb);
+                        LOG("[S3] RefBase najden @%p (offset +%ld), incStrong vzyat", rb, off);
+                    } else {
+                        LOG("[S3] RefBase NE najden - propusk incStrong");
+                    }
+                }
                 if (cbSetSize) { int r1 = cbSetSize(bic, (uint32_t)W, (uint32_t)H); LOG("[S3b] setDefaultBufferSize(%d,%d) rc=%d", W, H, r1); }
                 if (cbSetFmt)  { int r2 = cbSetFmt(bic, 1 /*RGBA_8888*/);            LOG("[S3b] setDefaultBufferFormat(RGBA_8888) rc=%d", r2); }
             }
