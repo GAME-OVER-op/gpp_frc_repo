@@ -221,7 +221,7 @@ static void* drain_thread(void*) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 15) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 18: out=NV12_VENUS) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (cbSetSize) { int r1 = cbSetSize(bic, (uint32_t)W, (uint32_t)H); LOG("[S3b] setDefaultBufferSize(%d,%d) rc=%d", W, H, r1); }
-                if (cbSetFmt)  { int r2 = cbSetFmt(bic, 1 /*RGBA_8888*/);            LOG("[S3b] setDefaultBufferFormat(RGBA_8888) rc=%d", r2); }
+                if (cbSetFmt)  { int r2 = cbSetFmt(bic, 0x7FA30C04 /*NV12 Venus -> getOutFormat daet Venus, YUV-bufer poluchaet extradata*/); LOG("[S3b] setDefaultBufferFormat(NV12_VENUS 0x7FA30C04) rc=%d", r2); }
             }
         }
     } else { LOG("[S3] upalo na createBufferQueue/BufferItemConsumer"); }
