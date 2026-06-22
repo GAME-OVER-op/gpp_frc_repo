@@ -1,19 +1,23 @@
 #!/system/bin/sh
-# run.sh - zapusk gpp_frc_test (Phase 2) iz toj zhe papki, gde lezhit binar.
+# run.sh - zapusk gpp_frc_test (Phase 5) iz toj zhe papki, gde lezhit binar.
 # Ispolzovanie:
-#   sh run.sh             # obychnyj zapusk (sam podnimet root cherez su), 150 kadrov
-#   sh run.sh 300         # zadat chislo kadrov
-#   sh run.sh 150 --no-su  # bez su (esli uzhe root)
+#   sh run.sh                    # obychnyj zapusk (sam podnimet root cherez su), 150 kadrov
+#   sh run.sh 300                # zadat chislo kadrov
+#   sh run.sh 150 --no-su        # bez su (esli uzhe root)
+#   sh run.sh --permissive       # TEST: na vremya zapuska setenforce 0 (proverka SELinux),
+#                                #       posle zapuska SELinux vozvraschaetsya kak byl
 
 BIN="gpp_frc_test"
 
-# --- razobrat argumenty: chislo kadrov i/ili --no-su ---
+# --- razobrat argumenty ---
 FRAMES=""
 NOSU=0
+PERMISSIVE=0
 for a in "$@"; do
   case "$a" in
-    --no-su) NOSU=1 ;;
-    *[0-9]*) FRAMES="$a" ;;
+    --no-su)      NOSU=1 ;;
+    --permissive) PERMISSIVE=1 ;;
+    *[0-9]*)      FRAMES="$a" ;;
   esac
 done
 
@@ -30,7 +34,9 @@ fi
 # --- esli ne root i ne prosili --no-su - perezapustitsya cherez su ---
 if [ "$NOSU" != "1" ] && [ "$(id -u 2>/dev/null)" != "0" ]; then
   echo "[*] podnimayu root cherez su ..."
-  exec su -c "sh '$DIR/$(basename "$0")' $FRAMES --no-su"
+  EXTRA=""
+  [ "$PERMISSIVE" = "1" ] && EXTRA="--permissive"
+  exec su -c "sh '$DIR/$(basename "$0")' $FRAMES $EXTRA --no-su"
 fi
 
 LOG="$DIR/gpp_frc_run_$(date +%Y%m%d_%H%M%S).log"
@@ -42,10 +48,20 @@ echo "=================================================="
 echo " bin    : $BINPATH"
 echo " log    : $LOG"
 echo " frames : ${FRAMES:-150 (po umolchaniyu)}"
+echo " permissive : $PERMISSIVE"
 echo " LD_LIBRARY_PATH : $LIBS"
 echo "=================================================="
 
-# --- sbrosit i nachat zahvat POLNOGO logcat v fone (lovim FRC/BufferQueue/SurfaceFlinger) ---
+# --- SELinux: zapomnit i (opcionalno) vremenno snyat enforcing ---
+SE_WAS=$(getenforce 2>/dev/null)
+if [ "$PERMISSIVE" = "1" ]; then
+  echo "[*] SELinux bylo: $SE_WAS -> stavlyu Permissive na vremya testa"
+  setenforce 0 2>/dev/null
+  echo "[*] SELinux teper: $(getenforce 2>/dev/null)"
+fi
+
+# --- ochistit kernel audit, sbrosit i nachat zahvat POLNOGO logcat v fone ---
+dmesg -c >/dev/null 2>&1
 logcat -c 2>/dev/null
 logcat -v time > "$LOG.full" 2>/dev/null &
 LOGPID=$!
@@ -61,12 +77,24 @@ echo "----- binar zavershyon, kod $RC -----"
 sleep 2
 kill "$LOGPID" 2>/dev/null
 
+# --- vernut SELinux kak bylo ---
+if [ "$PERMISSIVE" = "1" ]; then
+  case "$SE_WAS" in
+    Enforcing) setenforce 1 2>/dev/null; echo "[*] SELinux vozvraschyon v Enforcing" ;;
+    *)         echo "[*] SELinux ostavlen kak byl ($SE_WAS)" ;;
+  esac
+fi
+
+# --- kernel audit (avc denied, kotorye logcat ne pokazyvaet) ---
+dmesg 2>/dev/null | grep -iE 'avc|selinux|vpp|gpp' > "$LOG.dmesg" 2>/dev/null
+
 # --- vydernut interesnoe iz polnogo logcat ryadom ---
-grep -iE 'GPP|FRC|MotionEngine|VTxr|BufferQueue|Vpp|SurfaceFlinger|interpolat|Non-Interpolated' "$LOG.full" > "$LOG.gpp" 2>/dev/null
+grep -iE 'GPP|FRC|MotionEngine|VTxr|BufferQueue|Vpp|SurfaceFlinger|interpolat|Non-Interpolated|avc|denied|configstore|hexlp' "$LOG.full" > "$LOG.gpp" 2>/dev/null
 
 echo
 echo "[+] gotovo."
 echo "[+] stdout binarya : $LOG"
 echo "[+] polnyj logcat  : $LOG.full"
 echo "[+] otfiltrovano   : $LOG.gpp"
-echo "[+] skinь mne $LOG i $LOG.gpp (a esli malo - i .full)."
+echo "[+] kernel audit   : $LOG.dmesg"
+echo "[+] skin' mne $LOG, $LOG.gpp i $LOG.dmesg"

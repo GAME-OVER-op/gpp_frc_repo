@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 4 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 5 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -99,7 +99,7 @@ static void draw_frame(ANativeWindow_Buffer* b, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 4) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 5) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -210,6 +210,22 @@ int main(int argc, char** argv) {
         }
     } else { LOG("[S5] upalo na connect()"); return 1; }
     if (!inGbp.p) { LOG("FATAL: connect ne vernul vhodnoj producer"); return 1; }
+
+    // -------- S5b: dampnut vnutrennie ukazateli GPPProducer --------
+    // Iz disasm: query() chitaet inner-producer iz this+0x30, dequeueBuffer iz this+0x20.
+    // Esli oni nulevye/dikie -> connect ne dovyazal konvejer (rc=1).
+    g_stage = 5;
+    if (sigsetjmp(g_jmp, 1) == 0) {
+        unsigned char* o = (unsigned char*)inGbp.p;
+        void* in20  = *(void**)(o + 0x20);
+        void* cons28= *(void**)(o + 0x28);
+        void* out30 = *(void**)(o + 0x30);
+        int   w38   = *(int*)(o + 0x38);
+        int   h3c   = *(int*)(o + 0x3c);
+        LOG("[S5b] GPPProducer inner: in(+0x20)=%p cons(+0x28)=%p out(+0x30)=%p  cached %dx%d",
+            in20, cons28, out30, w38, h3c);
+        if (!in20 || !out30) LOG("[S5b] VNIMANIE: inner-producer NULL -> connect ne dovyazal konvejer (nuzhen VPP HAL/configstore)");
+    } else { LOG("[S5b] damp inner upal"); }
 
     // -------- S6: obernut vhodnoj producer v Surface --------
     g_stage = 6;
