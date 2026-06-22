@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 12 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 13 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 12: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 13: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -58,7 +58,9 @@ static const char* SYM_GPPP_REQUEST= "_ZN7android11GPPProducer13requestBufferEiP
 static const char* SYM_GPPP_QUEUE  = "_ZN7android11GPPProducer11queueBufferEiRKNS_22IGraphicBufferProducer16QueueBufferInputEPNS1_17QueueBufferOutputE";
 static const char* SYM_GPPP_CANCEL = "_ZN7android11GPPProducer12cancelBufferEiRKNS_2spINS_5FenceEEE";
 static const char* SYM_GPPP_SETMAXDEQ = "_ZN7android11GPPProducer25setMaxDequeuedBufferCountEi";
-static const char* SYM_GPPP_SETTIMEOUT = "_ZN7android11GPPProducer16setDequeueTimeoutEl";
+static const char* SYM_GPPP_SETTIMEOUT = "_ZN7android11GPPProducer17setDequeueTimeoutEl";
+static const char* SYM_GPPP_SETASYNC   = "_ZN7android11GPPProducer12setAsyncModeEb";
+static const char* SYM_GPPP_ALLOWALLOC = "_ZN7android11GPPProducer15allowAllocationEb";
 static const char* SYM_GB_LOCK     = "_ZN7android13GraphicBuffer4lockEjRKNS_4RectEPPvPiS6_"; // lock(usage, Rect const&, void**, int*, int*)
 static const char* SYM_GB_UNLOCK   = "_ZN7android13GraphicBuffer6unlockEv";
 static const char* SYM_REGION_CTOR = "_ZN7android6RegionC1Ev";
@@ -158,7 +160,7 @@ static void* find_refbase(void* obj) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 12) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 13) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -339,9 +341,14 @@ int main(int argc, char** argv) {
     {
         using FnSetInt  = int(*)(void*, int);
         using FnSetLong = int(*)(void*, long);
+        using FnSetBool = int(*)(void*, bool);
         auto setMaxDeq = sym<FnSetInt>(SYM_GPPP_SETMAXDEQ);
         auto setTimeout= sym<FnSetLong>(SYM_GPPP_SETTIMEOUT);
+        auto setAsync  = sym<FnSetBool>(SYM_GPPP_SETASYNC);
+        auto allowAlloc= sym<FnSetBool>(SYM_GPPP_ALLOWALLOC);
         if (sigsetjmp(g_jmp, 1) == 0) {
+            if (allowAlloc) { int r = allowAlloc(inGbp.p, true);       LOG("[S6b] allowAllocation(true) rc=%d", r); }
+            if (setAsync)   { int r = setAsync(inGbp.p, true);         LOG("[S6b] setAsyncMode(true) rc=%d", r); }
             if (setMaxDeq)  { int r = setMaxDeq(inGbp.p, 6);            LOG("[S6b] setMaxDequeuedBufferCount(6) rc=%d", r); }
             if (setTimeout) { int r = setTimeout(inGbp.p, 50000000L);  LOG("[S6b] setDequeueTimeout(50ms) rc=%d", r); }
         } else { LOG("[S6b] nastrojka buferov upala (ne kriticno)"); }
