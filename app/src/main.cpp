@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 13 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 14 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -26,6 +26,7 @@
 #include <cstring>
 #include <string>
 #include <unistd.h>
+#include <pthread.h>
 
 #define TAG "GPP_FRC_TEST"
 #define LOG(...) do { __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); \
@@ -48,8 +49,12 @@ static const char* SYM_SURFACE_CTOR   = "_ZN7android7SurfaceC1ERKNS_2spINS_22IGr
 static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBufferProducerEv";
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
+static const char* SYM_BITEM_CTOR     = "_ZN7android10BufferItemC1Ev";
+static const char* SYM_BITEM_DTOR     = "_ZN7android10BufferItemD1Ev";
+static const char* SYM_BIC_ACQUIRE    = "_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElb";
+static const char* SYM_BIC_RELEASE    = "_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEE";
 
-// ---- Phase 13: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 14: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -88,6 +93,10 @@ using FnGbLock     = int    (*)(void* thiz, uint32_t usage, const void* rect, vo
 using FnGbUnlock   = int    (*)(void* thiz);
 using FnRegionCtor = void   (*)(void* thiz);
 using FnIncStrong  = void   (*)(const void* thiz, const void* id);
+using FnBItemCtor  = void   (*)(void* item);
+using FnBItemDtor  = void   (*)(void* item);
+using FnAcquire    = int    (*)(void* thiz, void* item, long presentWhen, bool waitForFence);
+using FnRelease    = int    (*)(void* thiz, const void* item, const Sp* relFence);
 
 // ---- krash-gard ----
 static sigjmp_buf g_jmp;
@@ -159,8 +168,36 @@ static void* find_refbase(void* obj) {
     return nullptr;
 }
 
+// ---- S6c: drenazh vyhodnoj ocheredi v otdelnom potoke ----
+// Bez dren'azha vyhod dvizhka zapolnyaetsya -> dvizhok vstayot -> ne otpuskaet
+// vhodnoj bufer -> nash dequeue(kadr 1) visnet navsegda. Acquire+Release osvobozhdaet.
+static void* g_drn_bic = nullptr;
+static FnAcquire g_drn_acq = nullptr;
+static FnRelease g_drn_rel = nullptr;
+static FnBItemCtor g_drn_bictor = nullptr;
+static FnBItemDtor g_drn_bidtor = nullptr;
+static void* g_drn_noFence = nullptr;
+static volatile int g_drn_run = 0;
+static volatile int g_drn_count = 0;
+static void* drain_thread(void*) {
+    while (g_drn_run) {
+        char item[512]; memset(item, 0, sizeof(item));
+        if (g_drn_bictor) g_drn_bictor(item);
+        int rc = -1;
+        if (g_drn_acq && g_drn_bic) rc = g_drn_acq(g_drn_bic, item, 0L, false);
+        if (rc == 0) {
+            Sp relFence; relFence.p = g_drn_noFence;
+            if (g_drn_rel) g_drn_rel(g_drn_bic, item, &relFence);
+            ++g_drn_count;
+        }
+        if (g_drn_bidtor) g_drn_bidtor(item);
+        usleep(2000);
+    }
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 13) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 14) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -354,6 +391,27 @@ int main(int argc, char** argv) {
         } else { LOG("[S6b] nastrojka buferov upala (ne kriticno)"); }
     }
 
+    // -------- S6c: zapusk drenazha vyhodnoj ocheredi --------
+    pthread_t drnTid = 0; bool drnStarted = false;
+    {
+        g_drn_bic     = bic;
+        g_drn_acq     = sym<FnAcquire>(SYM_BIC_ACQUIRE);
+        g_drn_rel     = sym<FnRelease>(SYM_BIC_RELEASE);
+        g_drn_bictor  = sym<FnBItemCtor>(SYM_BITEM_CTOR);
+        g_drn_bidtor  = sym<FnBItemDtor>(SYM_BITEM_DTOR);
+        g_drn_noFence = g_noFence;
+        if (g_drn_bic && g_drn_acq && g_drn_rel && g_drn_bictor && g_drn_bidtor) {
+            g_drn_run = 1;
+            if (pthread_create(&drnTid, nullptr, drain_thread, nullptr) == 0) {
+                drnStarted = true;
+                LOG("[S6c] potok drenazha vyhoda zapushchen (acquire+release)");
+            } else { g_drn_run = 0; LOG("[S6c] pthread_create UPAL"); }
+        } else {
+            LOG("[S6c] net simvolov drenazha (acq=%p rel=%p ctor=%p dtor=%p) - propusk",
+                (void*)g_drn_acq, (void*)g_drn_rel, (void*)g_drn_bictor, (void*)g_drn_bidtor);
+        }
+    }
+
     // -------- S7: dequeue -> request -> lock -> draw -> queue (per-kadr pod gardom) --------
     g_stage = 7;
     void* gbslot[64]; memset(gbslot, 0, sizeof(gbslot));
@@ -433,7 +491,8 @@ int main(int argc, char** argv) {
         if (i % 30 == 0) LOG("[S7] kadr %d (otdano=%d, cancel=%d)", i, posted, use_cancel ? 1 : 0);
         usleep(16000);
     }
-    LOG("[S7] vsego otdano kadrov dvizhku: %d", posted);
+    if (drnStarted) { g_drn_run = 0; pthread_join(drnTid, nullptr); }
+    LOG("[S7] vsego otdano kadrov dvizhku: %d, drenirovano vyhodnyh kadrov: %d", posted, g_drn_count);
     LOG("=== gotovo. smotri logcat: FRC/Interpolated/MotionEngine/BufferQueue ===");
     return 0;
 }
