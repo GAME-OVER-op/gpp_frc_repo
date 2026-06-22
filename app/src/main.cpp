@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 6 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 7 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 6: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 7: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -57,7 +57,7 @@ static const char* SYM_GPPP_DEQUEUE= "_ZN7android11GPPProducer13dequeueBufferEPi
 static const char* SYM_GPPP_REQUEST= "_ZN7android11GPPProducer13requestBufferEiPNS_2spINS_13GraphicBufferEEE";
 static const char* SYM_GPPP_QUEUE  = "_ZN7android11GPPProducer11queueBufferEiRKNS_22IGraphicBufferProducer16QueueBufferInputEPNS1_17QueueBufferOutputE";
 static const char* SYM_GPPP_CANCEL = "_ZN7android11GPPProducer12cancelBufferEiRKNS_2spINS_5FenceEEE";
-static const char* SYM_GB_LOCK     = "_ZN7android13GraphicBuffer4lockEjPPv";
+static const char* SYM_GB_LOCK     = "_ZN7android13GraphicBuffer4lockEjRKNS_4RectEPPvPiS6_"; // lock(usage, Rect const&, void**, int*, int*)
 static const char* SYM_GB_UNLOCK   = "_ZN7android13GraphicBuffer6unlockEv";
 static const char* SYM_REGION_CTOR = "_ZN7android6RegionC1Ev";
 static const char* SYM_REGION_DTOR = "_ZN7android6RegionD1Ev";
@@ -78,7 +78,7 @@ using FnGppDequeue = int    (*)(void* thiz, int* slot, Sp* fence, uint32_t w, ui
 using FnGppRequest = int    (*)(void* thiz, int slot, Sp* gbOut);
 using FnGppQueue   = int    (*)(void* thiz, int slot, const void* qbi, void* qbo);
 using FnGppCancel  = int    (*)(void* thiz, int slot, const Sp* fence);
-using FnGbLock     = int    (*)(void* thiz, uint32_t usage, void** vaddr);
+using FnGbLock     = int    (*)(void* thiz, uint32_t usage, const void* rect, void** vaddr, int* obpp, int* obps);
 using FnGbUnlock   = int    (*)(void* thiz);
 using FnRegionCtor = void   (*)(void* thiz);
 
@@ -123,7 +123,7 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 6) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 7) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -303,37 +303,56 @@ int main(int argc, char** argv) {
         }
         void* gb = gbslot[slot];
         if (!gb) { LOG("[S7] net GraphicBuffer dlya slota %d", slot); break; }
-        // ANativeWindowBuffer: width@40, height@44, stride@48, format@52 (piksel-stride)
-        int gw = *(int*)((char*)gb + 40), gh = *(int*)((char*)gb + 44);
-        int gstride = *(int*)((char*)gb + 48), gfmt = *(int*)((char*)gb + 52);
+        // ANativeWindowBuffer: baza android_native_base_t = 56 bajt (magic,version,reserved[4],incRef,decRef)
+        // => width@56, height@60, stride@64, format@68 (piksel-stride)
+        int gw = *(int*)((char*)gb + 56), gh = *(int*)((char*)gb + 60);
+        int gstride = *(int*)((char*)gb + 64), gfmt = *(int*)((char*)gb + 68);
         if (i == 0) LOG("[S7] GraphicBuffer %dx%d stride=%d fmt=%d", gw, gh, gstride, gfmt);
         int dw = (gw > 0 && gw <= 4096) ? gw : W;
         int dh = (gh > 0 && gh <= 4096) ? gh : H;
         int dstride = (gstride >= dw && gstride <= dw + 4096) ? gstride : dw;
         void* vaddr = nullptr;
         if (gbLock) {
-            int lr = gbLock(gb, (uint32_t)USAGE, &vaddr);
-            if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p", lr, vaddr);
+            int lockRect[4] = { 0, 0, dw, dh };   // Rect{left,top,right,bottom}
+            int obpp = 0, obps = 0;
+            int lr = gbLock(gb, (uint32_t)USAGE, lockRect, &vaddr, &obpp, &obps);
+            if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p bpp=%d", lr, vaddr, obpp);
             if (lr == 0 && vaddr) { draw_raw(vaddr, dw, dh, dstride, i); if (gbUnlock) gbUnlock(gb); }
         }
         if (!use_cancel && gppQueue) {
-            char qbi[256]; memset(qbi, 0, sizeof(qbi));
-            *(int64_t*)(qbi + 0)   = 0;      // timestamp
-            *(int*)(qbi + 8)       = 1;      // isAutoTimestamp
-            *(int*)(qbi + 12)      = 0;      // dataSpace UNKNOWN
-            *(int*)(qbi + 16)      = 0;      // crop.left
-            *(int*)(qbi + 20)      = 0;      // crop.top
-            *(int*)(qbi + 24)      = W;      // crop.right
-            *(int*)(qbi + 28)      = H;      // crop.bottom
-            *(int*)(qbi + 32)      = 0;      // scalingMode
-            *(uint32_t*)(qbi + 36) = 0;      // transform
-            *(uint32_t*)(qbi + 40) = 0;      // stickyTransform
-            *(void**)(qbi + 48)    = nullptr;// fence sp<>
-            if (regionCtor) regionCtor(qbi + 56);   // surfaceDamage Region (nastoyaschij ctor)
-            char qboQ[256]; memset(qboQ, 0, sizeof(qboQ));
-            int qr = gppQueue(inGbp.p, slot, qbi, qboQ);
-            if (regionDtor) regionDtor(qbi + 56);
-            if (i == 0) LOG("[S7] queueBuffer slot=%d rc=%d", slot, qr);
+            // sobrat QueueBufferInput; crop - po realnym razmeram bufera (gw/gh), inache W/H
+            int cw = (gw > 0 && gw <= 4096) ? gw : W;
+            int ch = (gh > 0 && gh <= 4096) ? gh : H;
+            // helper: odna popytka queueBuffer s zadannym crop (cl,ct,cr,cb)
+            auto try_queue = [&](int cl, int ct, int cr, int cb) -> int {
+                char qbi[256]; memset(qbi, 0, sizeof(qbi));
+                *(int64_t*)(qbi + 0)   = 0;      // timestamp
+                *(int*)(qbi + 8)       = 1;      // isAutoTimestamp
+                *(int*)(qbi + 12)      = 0;      // dataSpace UNKNOWN
+                *(int*)(qbi + 16)      = cl;     // crop.left
+                *(int*)(qbi + 20)      = ct;     // crop.top
+                *(int*)(qbi + 24)      = cr;     // crop.right
+                *(int*)(qbi + 28)      = cb;     // crop.bottom
+                *(int*)(qbi + 32)      = 0;      // scalingMode FREEZE
+                *(uint32_t*)(qbi + 36) = 0;      // transform
+                *(uint32_t*)(qbi + 40) = 0;      // stickyTransform
+                *(void**)(qbi + 48)    = nullptr;// fence sp<>
+                if (regionCtor) regionCtor(qbi + 56);   // surfaceDamage Region
+                char qboQ[256]; memset(qboQ, 0, sizeof(qboQ));
+                int r = gppQueue(inGbp.p, slot, qbi, qboQ);
+                if (regionDtor) regionDtor(qbi + 56);
+                return r;
+            };
+            int qr = try_queue(0, 0, cw, ch);
+            if (qr < 0 && i == 0) {
+                LOG("[S7] queueBuffer crop(0,0,%d,%d) rc=%d -> probuyu drugie varianty crop", cw, ch, qr);
+                int qr2 = try_queue(0, 0, 0, 0);                 // pustoj crop = ves bufer
+                LOG("[S7]   crop EMPTY(0,0,0,0) rc=%d", qr2);
+                int qr3 = try_queue(0, 0, W, H);                 // zaproshennyj W/H
+                LOG("[S7]   crop(0,0,%d,%d) rc=%d", W, H, qr3);
+                if (qr2 >= 0) qr = qr2; else if (qr3 >= 0) qr = qr3;
+            }
+            if (i == 0) LOG("[S7] queueBuffer slot=%d itog rc=%d", slot, qr);
             if (qr < 0) { if (i == 0) LOG("[S7] queueBuffer oshibka -> perehozhu na cancelBuffer"); use_cancel = true; }
             else ++posted;
         }
