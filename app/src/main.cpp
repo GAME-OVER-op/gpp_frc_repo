@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 7 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 8 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -49,7 +49,7 @@ static const char* SYM_SURF_GETIGBP   = "_ZNK7android7Surface25getIGraphicBuffer
 static const char* SYM_CREATE_BQ      = "_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb";
 static const char* SYM_BIC_CTOR       = "_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib";
 
-// ---- Phase 7: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 8: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -61,6 +61,7 @@ static const char* SYM_GB_LOCK     = "_ZN7android13GraphicBuffer4lockEjRKNS_4Rec
 static const char* SYM_GB_UNLOCK   = "_ZN7android13GraphicBuffer6unlockEv";
 static const char* SYM_REGION_CTOR = "_ZN7android6RegionC1Ev";
 static const char* SYM_REGION_DTOR = "_ZN7android6RegionD1Ev";
+static const char* SYM_FENCE_NOF   = "_ZN7android5Fence8NO_FENCEE"; // sp<Fence> Fence::NO_FENCE
 
 // ---- FFI tipy ----
 using FnFactory    = void*  (*)();
@@ -123,7 +124,7 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 7) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 8) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -162,6 +163,10 @@ int main(int argc, char** argv) {
     auto gbUnlock      = sym<FnGbUnlock>(SYM_GB_UNLOCK);
     auto regionCtor    = sym<FnRegionCtor>(SYM_REGION_CTOR);
     auto regionDtor    = sym<FnRegionCtor>(SYM_REGION_DTOR);
+    void* noFenceSp = dlsym(g_lib, SYM_FENCE_NOF);
+    if (!noFenceSp) noFenceSp = dlsym(RTLD_DEFAULT, SYM_FENCE_NOF);
+    void* g_noFence = noFenceSp ? *(void**)noFenceSp : nullptr;
+    LOG("[S1] Fence::NO_FENCE sp=%p fence=%p", noFenceSp, g_noFence);
     void* vtSession    = dlsym(g_lib, SYM_VT_SESSION);
     void* vtComponent  = dlsym(g_lib, SYM_VT_COMPONENT);
     void* vtProducer   = dlsym(g_lib, SYM_VT_PRODUCER);
@@ -313,16 +318,16 @@ int main(int argc, char** argv) {
         int dstride = (gstride >= dw && gstride <= dw + 4096) ? gstride : dw;
         void* vaddr = nullptr;
         if (gbLock) {
-            int lockRect[4] = { 0, 0, dw, dh };   // Rect{left,top,right,bottom}
+            int lockRect[4] = { 0, 0, W, H };   // Rect{left,top,right,bottom}
             int obpp = 0, obps = 0;
             int lr = gbLock(gb, (uint32_t)USAGE, lockRect, &vaddr, &obpp, &obps);
-            if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p bpp=%d", lr, vaddr, obpp);
-            if (lr == 0 && vaddr) { draw_raw(vaddr, dw, dh, dstride, i); if (gbUnlock) gbUnlock(gb); }
+            int spix = (obps > 0 && obpp > 0) ? obps / obpp : W;   // stride v pikselyah
+            if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p bpp=%d stride_px=%d", lr, vaddr, obpp, spix);
+            if (lr == 0 && vaddr) { draw_raw(vaddr, W, H, spix, i); if (gbUnlock) gbUnlock(gb); }
         }
         if (!use_cancel && gppQueue) {
             // sobrat QueueBufferInput; crop - po realnym razmeram bufera (gw/gh), inache W/H
-            int cw = (gw > 0 && gw <= 4096) ? gw : W;
-            int ch = (gh > 0 && gh <= 4096) ? gh : H;
+            int cw = W, ch = H;   // bufer dequeued na W×H; polya GraphicBuffer chitayutsya nekorrektno
             // helper: odna popytka queueBuffer s zadannym crop (cl,ct,cr,cb)
             auto try_queue = [&](int cl, int ct, int cr, int cb) -> int {
                 char qbi[256]; memset(qbi, 0, sizeof(qbi));
@@ -336,7 +341,7 @@ int main(int argc, char** argv) {
                 *(int*)(qbi + 32)      = 0;      // scalingMode FREEZE
                 *(uint32_t*)(qbi + 36) = 0;      // transform
                 *(uint32_t*)(qbi + 40) = 0;      // stickyTransform
-                *(void**)(qbi + 48)    = nullptr;// fence sp<>
+                *(void**)(qbi + 48)    = g_noFence; // fence sp<Fence> = Fence::NO_FENCE (NE nullptr! inache BAD_VALUE)
                 if (regionCtor) regionCtor(qbi + 56);   // surfaceDamage Region
                 char qboQ[256]; memset(qboQ, 0, sizeof(qboQ));
                 int r = gppQueue(inGbp.p, slot, qbi, qboQ);
