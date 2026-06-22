@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 3 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 4 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -99,7 +99,7 @@ static void draw_frame(ANativeWindow_Buffer* b, int frame) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 3) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 4) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -203,7 +203,11 @@ int main(int argc, char** argv) {
         std::string pkg   = "com.tencent.tmgp.sgame";
         std::string layer = "SurfaceView[com.tencent.tmgp.sgame/test]#0";
         long rc = sessConnect(session, &pkg, &layer, &outGbp, &inGbp);
-        LOG("[S5] connect() rc=%ld  inGbp(IGraphicBufferProducer*)=%p", rc, inGbp.p);
+        LOG("[S5] connect() rc=%ld  inGbp(IGraphicBufferProducer*)=%p klass=%s", rc, inGbp.p, idclass(inGbp.p));
+        if (inGbp.p) {
+            void* vptr = *(void**)inGbp.p;
+            LOG("[S5] inGbp vptr=%p (BufferQueueProducer => standartnyj; GPPProducer => kastomnyj)", vptr);
+        }
     } else { LOG("[S5] upalo na connect()"); return 1; }
     if (!inGbp.p) { LOG("FATAL: connect ne vernul vhodnoj producer"); return 1; }
 
@@ -215,18 +219,44 @@ int main(int argc, char** argv) {
         Sp nullBinder;
         surfCtor(surf, &inGbp, /*controlledByApp*/ true, &nullBinder);
         inWin = (ANativeWindow*)surf;   // Surface : ANativeWindow (offset 0)
-        LOG("[S6] Surface(inGbp) @%p", inWin);
-        ANativeWindow_setBuffersGeometry(inWin, W, H, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
-    } else { LOG("[S6] upalo na Surface(inGbp)"); return 1; }
+        LOG("[S6] Surface(inGbp) ctor OK @%p", inWin);
+    } else { LOG("[S6] upalo na konstruktore Surface(inGbp)"); return 1; }
 
-    // -------- S7: gnat kadry vo vhodnoj producer --------
+    // -------- S6b: proba okna (ne fatalno) --------
+    g_stage = 6;
+    if (sigsetjmp(g_jmp, 1) == 0) {
+        int w = ANativeWindow_getWidth(inWin);
+        int h = ANativeWindow_getHeight(inWin);
+        int f = ANativeWindow_getFormat(inWin);
+        LOG("[S6b] okno do nastrojki: %dx%d format=%d", w, h, f);
+    } else { LOG("[S6b] query okna upal (ne fatalno)"); }
+
+    // -------- S6c: setBuffersGeometry (ne fatalno) --------
+    g_stage = 6;
+    bool geom_ok = false;
+    if (sigsetjmp(g_jmp, 1) == 0) {
+        int rc = ANativeWindow_setBuffersGeometry(inWin, W, H, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
+        LOG("[S6c] setBuffersGeometry rc=%d", rc);
+        geom_ok = (rc == 0);
+    } else { LOG("[S6c] setBuffersGeometry UPAL (perform-hook). Probuyem dalshe bez nego."); }
+
+    // -------- S7: gnat kadry vo vhodnoj producer (kazhdyj kadr pod gardom) --------
     g_stage = 7;
-    int posted = 0;
+    int posted = 0, lockfail = 0;
     for (int i = 0; i < frames; ++i) {
-        if (sigsetjmp(g_jmp, 1) != 0) { LOG("[S7] upalo na kadre %d", i); break; }
+        if (sigsetjmp(g_jmp, 1) != 0) {
+            LOG("[S7] SIGSEGV/ABRT na kadre %d (lock/post). Stop.", i);
+            break;
+        }
         ANativeWindow_Buffer buf;
         int rc = ANativeWindow_lock(inWin, &buf, nullptr);
-        if (rc != 0) { LOG("[S7] lock kadr %d rc=%d (ochered polna/abandoned?)", i, rc); usleep(16000); continue; }
+        if (rc != 0) {
+            LOG("[S7] lock kadr %d rc=%d", i, rc);
+            if (++lockfail >= 5) { LOG("[S7] 5 podryad neudachnyh lock -> stop"); break; }
+            usleep(16000); continue;
+        }
+        lockfail = 0;
+        if (posted == 0) LOG("[S7] pervyj lock OK: %dx%d stride=%d format=%d", buf.width, buf.height, buf.stride, buf.format);
         draw_frame(&buf, i);
         ANativeWindow_unlockAndPost(inWin);
         ++posted;
