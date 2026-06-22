@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <unistd.h>
 #include <android/log.h>
 
 #define TAG "VPP_PROBE"
