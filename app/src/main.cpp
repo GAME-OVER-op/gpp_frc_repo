@@ -1,4 +1,4 @@
-// GPP-FRC standalone harness - Phase 14 (podacha kadrov cherez GPPSession::connect)
+// GPP-FRC standalone harness - Phase 15 (podacha kadrov cherez GPPSession::connect)
 //
 // Otlichie ot Phase 2: vyhodnoj IGraphicBufferProducer beryom NE iz Surface
 // AImageReader (privedenie ukazatelya padalo na Android 15/SDK36 -> S3 SIGSEGV),
@@ -54,7 +54,7 @@ static const char* SYM_BITEM_DTOR     = "_ZN7android10BufferItemD1Ev";
 static const char* SYM_BIC_ACQUIRE    = "_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElb";
 static const char* SYM_BIC_RELEASE    = "_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEE";
 
-// ---- Phase 14: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
+// ---- Phase 15: pryamoe upravlenie GPPProducer + nastrojka razreshenia ----
 static const char* SYM_CB_SETSIZE  = "_ZN7android12ConsumerBase20setDefaultBufferSizeEjj";
 static const char* SYM_CB_SETFMT   = "_ZN7android12ConsumerBase22setDefaultBufferFormatEi";
 static const char* SYM_GPPP_CONNECT= "_ZN7android11GPPProducer7connectERKNS_2spINS_17IProducerListenerEEEibPNS_22IGraphicBufferProducer17QueueBufferOutputE";
@@ -126,6 +126,12 @@ static const char* LIB_CANDIDATES[] = {
 };
 
 static const int W = 1280, H = 720;
+// Phase 15: kormim vhod kak NV12-Venus, chtoby gralloc vydelil extradata-region
+// (frc-mc trebuet Required=1445888 = NV12 1280x720 + 32768 metadannyh Venus).
+static const int  IN_FMT   = 0x7FA30C04; // HAL_PIXEL_FORMAT_YCbCr_420_SP_VENUS (NV12 Venus)
+static const uint64_t IN_USAGE = 0x10033; // SW_RD|SW_WR | HW_VIDEO_ENCODER (=> Venus extradata)
+static const int  NV12_SCANLINE = 736;   // align(720,32) - luma scanline
+
 
 // narisovat dvizhushijsya pryamougolnik v RGBA8888 bufer (stride v pikselyah)
 static void draw_raw(void* bits, int w, int h, int stride, int frame) {
@@ -139,6 +145,24 @@ static void draw_raw(void* bits, int w, int h, int stride, int frame) {
             row[x] = in ? 0xFF00FF00u : 0xFF202020u;
         }
     }
+}
+
+// Narisovat dvizhushijsya yarkostnyj blok v NV12 (Venus). ystride - bajt-stride Y.
+// Y: gradient+blok (dvizhetsya), UV: nejtralnaya hroma 128 (=> dvizhenie tolko v luma).
+static void draw_nv12(void* bits, int w, int h, int ystride, int frame) {
+    uint8_t* base = (uint8_t*)bits;
+    int rx = (frame * 12) % (w > 160 ? w - 160 : 1);
+    int ry = (frame * 7)  % (h > 160 ? h - 160 : 1);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* row = base + (size_t)y * ystride;
+        for (int x = 0; x < w; ++x) {
+            bool in = (x >= rx && x < rx + 160 && y >= ry && y < ry + 160);
+            row[x] = in ? (uint8_t)235 : (uint8_t)((x + frame * 4) & 0x7F);
+        }
+    }
+    // UV-ploskost: nejtral 128 (BT.601 seryj), scanline vyrovnen do 32
+    uint8_t* uv = base + (size_t)ystride * NV12_SCANLINE;
+    memset(uv, 128, (size_t)ystride * (NV12_SCANLINE / 2));
 }
 
 // Najti podobjekt RefBase vnutri objekta s virtualnym nasledovaniem.
@@ -197,7 +221,7 @@ static void* drain_thread(void*) {
 }
 
 int main(int argc, char** argv) {
-    LOG("=== GPP-FRC standalone harness (Phase 14) ===");
+    LOG("=== GPP-FRC standalone harness (Phase 15) ===");
     signal(SIGSEGV, on_sig);
     signal(SIGABRT, on_sig);
     signal(SIGBUS,  on_sig);
@@ -416,12 +440,12 @@ int main(int argc, char** argv) {
     g_stage = 7;
     void* gbslot[64]; memset(gbslot, 0, sizeof(gbslot));
     int posted = 0, deqfail = 0; bool use_cancel = false;
-    const uint64_t USAGE = 0x33; // SW_READ_OFTEN | SW_WRITE_OFTEN
+    const uint64_t USAGE = IN_USAGE; // Phase 15: NV12-Venus + video usage
     for (int i = 0; i < frames; ++i) {
         if (sigsetjmp(g_jmp, 1) != 0) { LOG("[S7] signal na kadre %d -> stop", i); break; }
         if (!gppDequeue) { LOG("[S7] net dequeueBuffer"); break; }
         int slot = -1; Sp fence; uint64_t age = 0;
-        int rc = gppDequeue(inGbp.p, &slot, &fence, (uint32_t)W, (uint32_t)H, 1 /*RGBA_8888*/, USAGE, &age, nullptr);
+        int rc = gppDequeue(inGbp.p, &slot, &fence, (uint32_t)W, (uint32_t)H, IN_FMT /*NV12-Venus*/, USAGE, &age, nullptr);
         if (i == 0 || rc < 0) LOG("[S7] dequeueBuffer kadr %d -> rc=%d slot=%d", i, rc, slot);
         if (rc < 0 || slot < 0 || slot >= 64) {
             if (++deqfail >= 5) { LOG("[S7] 5 neudachnyh dequeue -> stop"); break; }
@@ -449,7 +473,8 @@ int main(int argc, char** argv) {
             int lr = gbLock(gb, (uint32_t)USAGE, lockRect, &vaddr, &obpp, &obps);
             int spix = (obps > 0 && obpp > 0) ? obps / obpp : W;   // stride v pikselyah
             if (i == 0) LOG("[S7] GraphicBuffer::lock rc=%d vaddr=%p bpp=%d stride_px=%d", lr, vaddr, obpp, spix);
-            if (lr == 0 && vaddr) { draw_raw(vaddr, W, H, spix, i); if (gbUnlock) gbUnlock(gb); }
+            int ystride_b = (obps > 0) ? obps : W; // bajt-stride Y ploskosti
+            if (lr == 0 && vaddr) { draw_nv12(vaddr, W, H, ystride_b, i); if (gbUnlock) gbUnlock(gb); }
         }
         if (!use_cancel && gppQueue) {
             // sobrat QueueBufferInput; crop - po realnym razmeram bufera (gw/gh), inache W/H
