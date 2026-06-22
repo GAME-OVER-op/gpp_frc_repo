@@ -1,0 +1,33 @@
+name: disasm_vpp
+
+on:
+  push:
+    paths:
+      - 'vpplib/**'
+      - 'tools/disasm_vpp.sh'
+      - '.github/workflows/disasm_vpp.yml'
+  workflow_dispatch:
+
+jobs:
+  disasm_vpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 binutils + xz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu xz-utils
+          aarch64-linux-gnu-objdump --version | head -1
+
+      - name: Disassemble device libvpplibrary.so
+        run: |
+          chmod +x tools/disasm_vpp.sh
+          ./tools/disasm_vpp.sh vpplib/libvpplibrary.so disasm_vpp_out
+
+      - name: Upload disassembly
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpplib-disasm
+          path: disasm_vpp_out/
+          if-no-files-found: error
