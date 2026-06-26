@@ -65,6 +65,7 @@ struct DevFns {
     PFN_vkCmdBindPipeline             cmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets       cmdBindDescSets = nullptr;
     PFN_vkCmdDispatch                 cmdDispatch = nullptr;
+    PFN_vkCmdPushConstants            cmdPushConst = nullptr;
     VkPhysicalDevice            phys = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps{};
     bool ok = false;
@@ -173,6 +174,7 @@ DevFns& devFns(VkDevice dev) {
     f.cmdBindPipeline        = (PFN_vkCmdBindPipeline)G("vkCmdBindPipeline");
     f.cmdBindDescSets        = (PFN_vkCmdBindDescriptorSets)G("vkCmdBindDescriptorSets");
     f.cmdDispatch            = (PFN_vkCmdDispatch)G("vkCmdDispatch");
+    f.cmdPushConst           = (PFN_vkCmdPushConstants)G("vkCmdPushConstants");
     auto pit = g_devPhys.find(dev);
     if (pit != g_devPhys.end()) {
         f.phys = pit->second;
@@ -356,12 +358,21 @@ bool ensureBlend(SwapInfo& sw, DevFns& f) {
 // current frame (CPU 50/50 blend) and present it BEFORE the real current
 // frame. Returns true if the app's wait semaphores were consumed by our
 // download submit (the caller must then present the real frame WITHOUT them).
+// Push-constant block fed to the GPU blend shader (layout must match blend.comp).
+struct BlendPC {
+    float baseAlpha;       // static-scene blend (0.5 = even)
+    float diffThreshold;   // luma-diff below this -> full blend
+    float diffSoftness;    // smoothstep width above threshold
+    float motionStrength;  // 0..1 scales how hard motion kills the blend
+    int32_t blurRadius;    // 0 = off; >0 = box-blur radius in high-motion zones
+};
+
 bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
     if (sw.gpuReady) return true;
     if (!f.createImage || !f.getImgReq || !f.bindImgMem || !f.createImageView ||
         !f.createDescSetLayout || !f.createDescPool || !f.allocDescSets || !f.updateDescSets ||
         !f.createPipeLayout || !f.createShaderModule || !f.createComputePipelines ||
-        !f.cmdBindPipeline || !f.cmdBindDescSets || !f.cmdDispatch) {
+        !f.cmdBindPipeline || !f.cmdBindDescSets || !f.cmdDispatch || !f.cmdPushConst) {
         LOGE("vk: gpu-blend missing device fns"); return false;
     }
     const VkFormat fmt = sw.format;  // matches swapchain (R8G8B8A8_UNORM = 37 on this device)
@@ -429,8 +440,10 @@ bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
     smci.codeSize = sizeof(blend_comp_spv); smci.pCode = blend_comp_spv;
     if (f.createShaderModule(sw.device, &smci, nullptr, &sw.gShader) != VK_SUCCESS) { LOGE("vk: gpu-blend shader module fail"); return false; }
 
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC)};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1; plci.pSetLayouts = &sw.gDescLayout;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     if (f.createPipeLayout(sw.device, &plci, nullptr, &sw.gPipeLayout) != VK_SUCCESS) { LOGE("vk: gpu-blend pipe layout fail"); return false; }
 
     VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -540,6 +553,9 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
         f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
+        BlendPC pc{ g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
+                   g_config.motion_strength, g_config.blur_radius };
+        f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
         uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
         f.cmdDispatch(sw.injCmd, gx, gy, 1);
         // gOut -> TRANSFER_SRC, dst -> TRANSFER_DST, copy interpolated midpoint into dst.

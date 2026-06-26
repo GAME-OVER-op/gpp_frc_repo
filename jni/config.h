@@ -17,6 +17,12 @@ struct Config {
     bool force_swap_interval_0 = true;
     bool present_bridge = false;  // Stage 1: inject duplicate presents (frame-gen bridge)
     bool debug = false;
+    // Stage 2B adaptive blend knobs (tunable live via cleanfg.prop)
+    float blend_alpha = 0.5f;       // base blend on static scenes
+    float diff_threshold = 0.08f;   // luma-diff motion sensitivity
+    float diff_softness = 0.12f;    // smoothstep width above threshold
+    float motion_strength = 1.0f;   // 0..1 how hard motion kills blend
+    int blur_radius = 0;            // 0 = off; box-blur radius in motion zones
     bool matchesPackage(const char* name) const;
 };
 

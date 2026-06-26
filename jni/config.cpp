@@ -74,6 +74,17 @@ static void parseConfigText(const std::string& content) {
             g_config.present_bridge = (val == "1" || val == "true");
         } else if (key == "debug") {
             g_config.debug = (val == "1" || val == "true");
+        } else if (key == "blend_alpha") {
+            g_config.blend_alpha = (float)atof(val.c_str());
+        } else if (key == "diff_threshold") {
+            g_config.diff_threshold = (float)atof(val.c_str());
+        } else if (key == "diff_softness") {
+            g_config.diff_softness = (float)atof(val.c_str());
+        } else if (key == "motion_strength") {
+            g_config.motion_strength = (float)atof(val.c_str());
+        } else if (key == "blur_radius") {
+            g_config.blur_radius = atoi(val.c_str());
+            if (g_config.blur_radius < 0) g_config.blur_radius = 0;
         }
     }
 
@@ -81,6 +92,9 @@ static void parseConfigText(const std::string& content) {
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
          g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);
+    LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
+         g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
+         g_config.motion_strength, g_config.blur_radius);
 }
 
 // Read an entire fd to EOF and parse it. Works for both a regular file fd
