@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.9.5-adaptive
-versionCode=12
+version=v0.9.6-interop
+versionCode=13
 author=clean-room
-description=Clean Zygisk FRC hook (present-bridge blend interpolation stage 2B GPU adaptive blend; no network)
+description=Clean Zygisk FRC hook (adaptive GPU blend; Stage 2 Vulkan<->GL AHB interop benchmark, opt-in; no network)

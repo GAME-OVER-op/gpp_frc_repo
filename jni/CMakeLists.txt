@@ -47,6 +47,7 @@ add_library(lybfghook SHARED
     hook_engine.cpp
     hook_egl.cpp
     hook_vulkan.cpp
+    interop_bench.cpp
     gpp_engine.cpp
     frame_gen.cpp
     config.cpp

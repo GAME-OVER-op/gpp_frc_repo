@@ -85,6 +85,8 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "blur_radius") {
             g_config.blur_radius = atoi(val.c_str());
             if (g_config.blur_radius < 0) g_config.blur_radius = 0;
+        } else if (key == "interop_bench") {
+            g_config.interop_bench = (val == "1" || val == "true");
         }
     }
 
@@ -95,6 +97,7 @@ static void parseConfigText(const std::string& content) {
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
+    LOGI("interop_bench=%d", g_config.interop_bench);
 }
 
 // Read an entire fd to EOF and parse it. Works for both a regular file fd

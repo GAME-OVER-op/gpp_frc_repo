@@ -23,6 +23,7 @@ struct Config {
     float diff_softness = 0.12f;    // smoothstep width above threshold
     float motion_strength = 1.0f;   // 0..1 how hard motion kills blend
     int blur_radius = 0;            // 0 = off; box-blur radius in motion zones
+    bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
     bool matchesPackage(const char* name) const;
 };
 

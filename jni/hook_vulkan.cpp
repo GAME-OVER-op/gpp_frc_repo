@@ -17,6 +17,8 @@
 #include <mutex>
 #include <cstring>
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
+#include "interop_bench.h"
+#include <atomic>
 
 namespace cleanfg {
 
@@ -649,6 +651,26 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
 }
 
 VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
+    // STAGE 2 one-shot interop benchmark (opt-in via cleanfg.prop interop_bench=1).
+    if (info && info->swapchainCount >= 1 && g_config.interop_bench) {
+        static std::atomic<bool> benchRan{false};
+        bool expected = false;
+        if (benchRan.compare_exchange_strong(expected, true)) {
+            VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
+            uint32_t bw = 0, bh = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                auto sit = g_swaps.find(info->pSwapchains[0]);
+                if (sit != g_swaps.end()) {
+                    dev = sit->second.device; bw = sit->second.extent.width; bh = sit->second.extent.height;
+                    DevFns& bf = devFns(dev); phys = bf.phys;
+                }
+            }
+            if (dev != VK_NULL_HANDLE && bw && bh && pGDPA) {
+                runInteropBenchmark(dev, phys, queue, 0, bw, bh, pGDPA, 120);
+            }
+        }
+    }
     if (info) {
         // STAGE 2A present-bridge: synthesize an interpolated midpoint frame
         // (CPU blend of the previous and current frame) and present it BEFORE
