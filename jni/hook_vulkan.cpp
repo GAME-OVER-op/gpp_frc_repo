@@ -532,35 +532,24 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     if (!ensureInject(sw, f)) return false;
     if (!ensureGpuBlend(sw, f)) return false;
 
-    int mult = g_config.multiplier;
-    if (mult < 2) mult = 2;
-    if (mult > 8) mult = 8;
-    const int inserts = mult - 1;          // synthetic frames shown before the real one
-    const int want = sw.gHasPrev ? inserts : 1;
-
-    // Acquire all destination images up front (cheap; no GPU work). We hold them
-    // until after one combined submit, then present them in order so FIFO paces
-    // them across vsyncs. Bail cleanly to a normal present on any failure.
-    uint32_t dstIdx[8];
-    int got = 0;
-    for (int k = 0; k < want; ++k) {
-        uint32_t di = 0;
-        f.resetFences(sw.device, 1, &sw.acqFence);
-        VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &di);
-        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
-            if (g_config.debug) LOGW("vk: blend acquire[%d] rc=%d", k, (int)ar);
-            break;
-        }
-        f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
-        if (di >= sw.images.size()) break;
-        dstIdx[got++] = di;
+    // Acquire the destination image BEFORE consuming app semaphores, so a
+    // timeout here falls back cleanly to a normal single present.
+    uint32_t dstIndex = 0;
+    f.resetFences(sw.device, 1, &sw.acqFence);
+    VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+        if (g_config.debug) LOGW("vk: blend acquire rc=%d", (int)ar);
+        return false;
     }
-    if (got < want) return false;
+    f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
+    if (dstIndex >= sw.images.size()) return false;
 
     VkImage src = sw.images[srcIndex];
+    VkImage dst = sw.images[dstIndex];
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
     auto imgBar = [&](VkImage img, VkImageLayout o, VkImageLayout n,
                       VkAccessFlags sa, VkAccessFlags da,
                       VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
@@ -580,7 +569,7 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     f.resetCmd(sw.injCmd, 0);
     f.beginCmd(sw.injCmd, &bi);
 
-    // (A) Copy the freshly-rendered swapchain image (src) into gCur.
+    // (1) Copy the freshly-rendered swapchain image (src) into our gCur image.
     imgBar(src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -592,15 +581,12 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     imgBar(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     if (!sw.gHasPrev) {
-        // No history yet: seed gPrev = cur and present a single duplicate.
-        imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // First frame: no history yet. Seed gPrev = cur and present a duplicate.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         imgBar(sw.gPrev, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                0, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -609,50 +595,43 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
         imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        VkImage d0 = sw.images[dstIdx[0]];
-        imgBar(d0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                0, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       d0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        imgBar(d0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         sw.gHasPrev = true;
     } else {
-        // (B) Produce `inserts` interpolated frames at alpha = k/mult into each dst.
-        for (int k = 1; k <= inserts; ++k) {
-            float alpha = (float)k / (float)mult;
-            if (k == 1) {
-                imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                       0, VK_ACCESS_SHADER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            } else {
-                imgBar(sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            }
-            f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
-            f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
-            BlendPC pc{ alpha, g_config.diff_threshold, g_config.diff_softness,
-                       g_config.motion_strength, g_config.blur_radius };
-            f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
-            uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
-            f.cmdDispatch(sw.injCmd, gx, gy, 1);
-            imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImage dk = sw.images[dstIdx[k-1]];
-            imgBar(dk, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           dk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-            imgBar(dk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
-                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        }
-        // History: gCur -> gPrev (both GENERAL), restore gPrev to GENERAL.
+        // gCur -> GENERAL (compute reads), gOut -> GENERAL (compute writes). gPrev already GENERAL.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
+        f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
+        BlendPC pc{ g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
+                   g_config.motion_strength, g_config.blur_radius };
+        f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
+        uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
+        f.cmdDispatch(sw.injCmd, gx, gy, 1);
+        // gOut -> TRANSFER_SRC, dst -> TRANSFER_DST, copy interpolated midpoint into dst.
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // History update: gCur -> gPrev (both currently GENERAL), leave gPrev GENERAL.
         imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -678,17 +657,14 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: blend submit fail"); return false; }
     f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
 
-    // Present the synthetic frame(s) in order; FIFO paces them across vsyncs.
-    for (int k = 0; k < got; ++k) {
-        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &swapchain;
-        pi.pImageIndices = &dstIdx[k];
-        orig_QueuePresent(queue, &pi);
-    }
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &swapchain;
+    pi.pImageIndices = &dstIndex;
+    orig_QueuePresent(queue, &pi);
 
     if (!sw.injLogged) {
-        LOGI("vk: gpu-blend interpolation active mult=%d inserts=%d src=%u %ux%u", mult, inserts, srcIndex, sw.extent.width, sw.extent.height);
+        LOGI("vk: gpu-blend interpolation active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
         sw.injLogged = true;
     }
     return true;
@@ -706,8 +682,7 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
         mci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         // Need spare images so we can hold one extra in-flight frame for
         // injection without starving the game's own acquire/present loop.
-        int spare = g_config.multiplier; if (spare < 2) spare = 2; if (spare > 8) spare = 8;
-        mci.minImageCount = origMin + spare + 2;
+        mci.minImageCount = origMin + 4;
     }
     VkResult r = orig_CreateSwapchain(device, &mci, alloc, out);
     if (r != VK_SUCCESS && g_config.present_bridge) {

@@ -9,8 +9,6 @@
 #include <thread>
 #include <vector>
 #include <cstdint>
-#include <chrono>
-#include <algorithm>
 
 #ifndef GL_APIENTRYP
 #define GL_APIENTRYP *
@@ -112,24 +110,6 @@ void evalThread(std::vector<uint8_t> f0, std::vector<uint8_t> f1,
         LOGI("extrap-eval: VERDICT best scale=%.2f predErr=%.3f %s baseline by %.1f%%",
              bestS, best, best < dupErr ? "BEATS" : "WORSE-than",
              dupErr > 0.0 ? 100.0 * (dupErr - best) / dupErr : 0.0);
-        // Cost on real frames: time the extension at the best scale (like a
-        // benchmark, but on real game content instead of synthetic input).
-        {
-            const int iters = 120;
-            std::vector<double> ms; ms.reserve(iters);
-            for (int i = 0; i < iters; ++i) {
-                auto t0c = std::chrono::steady_clock::now();
-                extrapolate(t0, t1, tout, bestS);
-                glFinish();
-                auto t1c = std::chrono::steady_clock::now();
-                ms.push_back(std::chrono::duration<double, std::milli>(t1c - t0c).count());
-            }
-            std::sort(ms.begin(), ms.end());
-            double sum = 0.0; for (double v : ms) sum += v;
-            LOGI("extrap-eval: cost @scale=%.2f over %d iters: min=%.3fms p50=%.3fms avg=%.3fms max=%.3fms",
-                 bestS, iters, ms.front(), ms[ms.size()/2], sum/(double)iters, ms.back());
-        }
-
         glDeleteTextures(1, &t0);
         glDeleteTextures(1, &t1);
         glDeleteTextures(1, &tout);
