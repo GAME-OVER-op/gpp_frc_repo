@@ -18,6 +18,7 @@
 #include <cstring>
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
 #include "interop_bench.h"
+#include "extrap_bench.h"
 #include <atomic>
 
 namespace cleanfg {
@@ -669,6 +670,20 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
             if (dev != VK_NULL_HANDLE && bw && bh && pGDPA) {
                 runInteropBenchmark(dev, phys, queue, 0, bw, bh, pGDPA, 120);
             }
+        }
+    }
+    // STAGE 2 one-shot Adreno frame-extrapolation probe (opt-in via extrap_bench=1).
+    if (info && info->swapchainCount >= 1 && g_config.extrap_bench) {
+        static std::atomic<bool> extrapRan{false};
+        bool expected = false;
+        if (extrapRan.compare_exchange_strong(expected, true)) {
+            uint32_t bw = 0, bh = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                auto sit = g_swaps.find(info->pSwapchains[0]);
+                if (sit != g_swaps.end()) { bw = sit->second.extent.width; bh = sit->second.extent.height; }
+            }
+            if (bw && bh) runExtrapBenchmark(bw, bh, 120);
         }
     }
     if (info) {
