@@ -1,20 +1,34 @@
-// Headless Ghidra script: exports decompiler-like C, symbols, functions and refs.
-// Place is auto-used by scripts/ghidra_full_analysis.sh.
+// Headless Ghidra script: exports functions, symbols and decompiled C.
+// Output directory resolution order:
+//   1) first script argument (recommended, absolute path)
+//   2) -Danalysis.out=... JVM property
+//   3) ANALYSIS_OUT environment variable
+//   4) "ghidra_out" in the current working directory
 import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
-import ghidra.program.model.address.Address;
 import java.io.*;
 
 public class ExportAnalysis extends GhidraScript {
   @Override
   public void run() throws Exception {
-    String outDir = System.getProperty("analysis.out", "ghidra_out");
+    String outDir = null;
+    String[] args = getScriptArgs();
+    if (args != null && args.length > 0 && args[0] != null && !args[0].isEmpty()) {
+      outDir = args[0];
+    }
+    if (outDir == null) outDir = System.getProperty("analysis.out");
+    if (outDir == null) outDir = System.getenv("ANALYSIS_OUT");
+    if (outDir == null) outDir = "ghidra_out";
+
     File dir = new File(outDir);
+    if (!dir.isAbsolute()) dir = dir.getAbsoluteFile();
     dir.mkdirs();
+    println("[ExportAnalysis] writing to: " + dir.getAbsolutePath());
+
     String name = currentProgram.getName().replaceAll("[^A-Za-z0-9._-]", "_");
 
     try (PrintWriter pw = new PrintWriter(new File(dir, name + ".functions.txt"))) {
@@ -47,5 +61,6 @@ public class ExportAnalysis extends GhidraScript {
     } finally {
       ifc.dispose();
     }
+    println("[ExportAnalysis] done");
   }
 }

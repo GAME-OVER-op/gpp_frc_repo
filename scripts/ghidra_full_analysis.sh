@@ -7,12 +7,13 @@ OUT="$ROOT/ghidra_out"
 mkdir -p "$PROJ" "$OUT"
 for f in "$ROOT"/binaries/*.so; do
   base="$(basename "$f")"
-  echo "[*] Ghidra analyze $base"
+  echo "[*] Ghidra analyze $base -> $OUT"
   "$GHIDRA_INSTALL_DIR/support/analyzeHeadless" "$PROJ" lybfghook \
     -import "$f" \
     -overwrite \
     -analysisTimeoutPerFile 1800 \
     -scriptPath "$ROOT/ghidra_scripts" \
-    -postScript ExportAnalysis.java \
-    -Danalysis.out="$OUT"
+    -postScript ExportAnalysis.java "$OUT"
 done
+echo "[*] ghidra_out contents:"
+ls -la "$OUT"
