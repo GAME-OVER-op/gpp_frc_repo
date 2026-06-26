@@ -12,4 +12,4 @@ diff_threshold=0.08
 diff_softness=0.12
 motion_strength=1.0
 blur_radius=0
-interop_bench=1
+interop_bench=0

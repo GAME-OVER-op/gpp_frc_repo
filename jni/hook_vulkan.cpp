@@ -694,7 +694,45 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
 
 VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                          const VkAllocationCallbacks* alloc, VkDevice* out) {
-    VkResult r = orig_CreateDevice(phys, ci, alloc, out);
+    // STAGE 2: the game does not enable the device extensions our Vulkan<->GL
+    // interop path needs (AHB import + external semaphore fd). Without them,
+    // vkGetDeviceProcAddr returns null for those entry points even though the
+    // physical device supports them. So we append the required device
+    // extensions here, with a safe fallback: if the driver rejects the
+    // augmented list we recreate the device exactly as the game asked, so the
+    // game can never fail to boot because of us.
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    bool augmented = false;
+    if (ci) {
+        static const char* kWanted[] = {
+            "VK_ANDROID_external_memory_android_hardware_buffer",
+            "VK_EXT_queue_family_foreign",
+            "VK_KHR_external_semaphore_fd",
+        };
+        std::vector<const char*> exts;
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i)
+            exts.push_back(ci->ppEnabledExtensionNames[i]);
+        for (const char* w : kWanted) {
+            bool have = false;
+            for (const char* e : exts) if (e && !strcmp(e, w)) { have = true; break; }
+            if (!have) exts.push_back(w);
+        }
+        if (exts.size() != ci->enabledExtensionCount) {
+            VkDeviceCreateInfo ci2 = *ci;
+            ci2.enabledExtensionCount = (uint32_t)exts.size();
+            ci2.ppEnabledExtensionNames = exts.data();
+            r = orig_CreateDevice(phys, &ci2, alloc, out);
+            if (r == VK_SUCCESS) {
+                augmented = true;
+                LOGI("vk: device created with interop extensions enabled (%u total)", ci2.enabledExtensionCount);
+            } else {
+                LOGW("vk: interop extensions rejected (r=%d); falling back to original device", r);
+            }
+        }
+    }
+    if (!augmented) {
+        r = orig_CreateDevice(phys, ci, alloc, out);
+    }
     if (r == VK_SUCCESS && out && *out) {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_devPhys[*out] = phys;
