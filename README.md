@@ -1,55 +1,84 @@
-# gpp-frc-test
+# lybfghook static analysis starter
 
-Stend dlya zapuska frejmgen-dvizhka RedMagic OS (G-FRC+ / MotionEngine Vulkan) na kastome.
-Sborka idyot v **GitHub Actions** s Android NDK - lokalnyj kompilyator ne nuzhen.
+Этот репозиторий — минимальная заготовка для загрузки `lybfghook` Zygisk `.so` в GitHub и последующего анализа в Ghidra/Rizin/IDA.
 
-## Phase 10 - podacha kadrov
+## Что внутри
 
-`gpp_frc_test` v realnom processe na telefone:
-1. `dlopen` dvizhka `libgppvppgfrcplussession.so` + razreshenie tochnyh simvolov
-   (`CreateFactory`, `GPPSession::GPPSession/connect`, `Surface::Surface/getIGraphicBufferProducer`);
-2. **S2** dyorgaet `CreateFactory()` i opredelyaet klass vozvrashyonnogo obyekta po vtable;
-3. **S3** sozdayot `AImageReader` (vyhodnoj priyomnik) i beryot ego `IGraphicBufferProducer`;
-4. **S4** sozdayot `GPPSession`;
-5. **S5** zovyot `GPPSession::connect(pkg, layer, output, &input)` - poluchaet vhodnoj producer;
-6. **S6** oborachivaet vhodnoj producer v `Surface`;
-7. **S7** gonit ~150 animirovannyh RGBA-kadrov v vhod (~60 fps);
-8. **S8** best-effort zabiraet vyhodnye kadry iz `AImageReader` v `/data/local/tmp/gpp_out_*.bin`.
+- `binaries/arm64-v8a.so` — AArch64 Zygisk module, stripped ELF, SONAME `liblybfghook.so`.
+- `binaries/armeabi-v7a.so` — ARMv7 Zygisk module, stripped ELF.
+- `notes/module.prop`, `notes/lyb.prop` — свойства Magisk/Zygisk-модуля.
+- `scripts/basic_static.sh` — быстрый сбор строк, импортов, секций, зависимостей.
+- `scripts/ghidra_headless.sh` — пример запуска headless Ghidra и экспорта decompile/C.
 
-Kazhdaya stadiya pod zashitoj ot krasha (SIGSEGV/SIGABRT/SIGBUS -> log + perehod dalshe),
-poetomu lyuboj sboj ostavlyaet log do tochki padeniya (vidno nomer stadii).
+## Предварительные выводы
 
-**Priznak uspeha** - v logcat poyavlyayutsya stroki dvizhka:
-`create BufferQueue done`, `FRC will do Nx interpolation`, `Send the Non-Interpolated frame`,
-logi MotionEngine/VTxr.
+Модуль содержит стандартные Zygisk entrypoints:
 
-## Kak sobrat
+- `zygisk_module_entry`
+- `zygisk_companion_entry`
 
-1. Sozdaj novyj repozitorij na GitHub i zalej tuda soderzhimoe etogo arhiva:
-   ```bash
-   git init && git add . && git commit -m "phase 3"
-   git branch -M main
-   git remote add origin git@github.com:<ty>/gpp-frc-test.git
-   git push -u origin main
-   ```
-2. Otkroj vkladku **Actions** - sborka zapustitsya avtomaticheski.
-3. Skachaj artefakt **gpp_frc_test-arm64-v8a**.
+Зависимости ARM64:
 
-## Kak zapustit na ustrojstve
+- `liblog.so`
+- `libGLESv3.so`
+- `libGLESv2.so`
+- `libEGL.so`
+- `libm.so`
+- `libdl.so`
+- `libc.so`
 
-Polozhi `gpp_frc_test` i `run.sh` v odnu papku (naprimer `/data/local/tmp/`) i:
-```sh
-sh run.sh            # 150 kadrov, sam podnimet root
-sh run.sh 300        # 300 kadrov
+В бинарнике статически видны OpenSSL/cpp-httplib/сетевые символы: `socket`, `connect`, `sendto`, `recvfrom`, `getaddrinfo`, HTTP/HTTPS строки, proxy env strings. Явных доменов аналитики при простом `strings` почти нет; скорее всего сетевой код либо общий bundled TLS/HTTP стек, либо адреса/пути собраны/зашифрованы/получаются динамически.
+
+Лицензия упоминает `Zygisk-UnityHook` от Rikka, поэтому начинать чистую реализацию логично с минимального Zygisk + Unity/GL hook, без embedded HTTP/TLS.
+
+## Рекомендуемый clean-room план
+
+1. Не переносить код из `.so` напрямую, только поведение/архитектурные идеи.
+2. Стартовать от официального Zygisk API / минимального шаблона.
+3. Оставить только:
+   - фильтр целевого process/package;
+   - `preAppSpecialize` / `postAppSpecialize`;
+   - `dlopen`/`dlsym` detection нужной Unity/GL библиотеки;
+   - локальный hook нужных функций;
+   - логирование через `__android_log_print` под debug flag.
+4. Убрать полностью:
+   - OpenSSL/curl/cpp-httplib;
+   - socket/connect/send/recv;
+   - любые remote config, license check, telemetry, analytics;
+   - фоновые сетевые threads.
+
+## Ghidra
+
+Установите Ghidra локально и запустите:
+
+```bash
+GHIDRA_INSTALL_DIR=/path/to/ghidra ./scripts/ghidra_headless.sh
 ```
-Skript sam sbrosit logcat, zapustit binar i soberyot:
-`*.log` (stdout), `*.log.full` (ves logcat), `*.log.gpp` (otfiltrovannye GPP/FRC stroki).
-Skinь mne `.log` i `.log.gpp`.
 
-## Struktura
-```
-.github/workflows/build.yml   - CI: NDK -> arm64-v8a -> artefakt
-app/CMakeLists.txt            - sborka (NDK: log dl mediandk android nativewindow)
-app/src/main.cpp              - Phase 10 harness
-run.sh                        - zapusk na ustrojstve + zahvat logov
-```
+После импорта ищите:
+
+- exports: `zygisk_module_entry`, `zygisk_companion_entry`;
+- references to `dlopen`, `dlsym`, `pthread_create`;
+- calls to `connect`, `sendto`, `recvfrom`, `getaddrinfo`;
+- references to `libGLESv2.so`, `libGLESv3.so`, `libEGL.so`;
+- init arrays / constructors.
+
+
+## GitHub Actions workflow
+
+В репозитории добавлен workflow `.github/workflows/analyze.yml`.
+
+Он запускается при каждом `push`, `pull_request` и вручную через `workflow_dispatch`.
+
+Что делает workflow:
+
+1. Устанавливает базовые ELF-инструменты.
+2. Запускает `scripts/basic_static.sh`.
+3. Скачивает Ghidra.
+4. Запускает headless Ghidra через `scripts/ghidra_full_analysis.sh`.
+5. Экспортирует результаты в:
+   - `analysis_out/`
+   - `ghidra_out/`
+6. Загружает ZIP с результатами как GitHub Actions artifact.
+
+Важно: Ghidra ZIP URL в workflow привязан к конкретной версии. Если GitHub/NSA изменит имя релиза, поменяйте `GHIDRA_VERSION` и URL в `.github/workflows/analyze.yml`.

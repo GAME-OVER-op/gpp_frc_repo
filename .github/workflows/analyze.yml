@@ -1,0 +1,57 @@
+name: Static analysis
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install base tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils file zip unzip python3 python3-pip jq curl default-jre-headless
+
+      - name: Basic ELF/static extraction
+        run: |
+          chmod +x scripts/basic_static.sh
+          ./scripts/basic_static.sh
+
+      - name: Download Ghidra
+        env:
+          GHIDRA_VERSION: 11.3.2
+        run: |
+          set -eux
+          curl -L -o /tmp/ghidra.zip "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20250415.zip"
+          unzip -q /tmp/ghidra.zip -d /opt
+          echo "GHIDRA_INSTALL_DIR=/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Headless Ghidra analysis
+        run: |
+          chmod +x scripts/ghidra_full_analysis.sh
+          ./scripts/ghidra_full_analysis.sh
+
+      - name: Build analysis archive
+        if: always()
+        run: |
+          zip -qr lybfghook-analysis-$ github.sha .zip analysis_out ghidra_out ghidra_project notes README.md scripts .github || true
+
+      - name: Upload analysis artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lybfghook-analysis-$ github.sha 
+          path: lybfghook-analysis-$ github.sha .zip
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,5 +1,0 @@
-cmake_minimum_required(VERSION 3.18)
-project(vpp_probe LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 17)
-add_executable(vpp_probe vpp_probe.cpp)
-target_link_libraries(vpp_probe log dl)
