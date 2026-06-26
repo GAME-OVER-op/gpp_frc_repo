@@ -31,7 +31,10 @@ void* hookFunction(void* target, void* replacement) {
 #include <dobby.h>
 void* hookFunction(void* target, void* replacement) {
     void* origin = nullptr;
-    if (DobbyHook(target, (dobby_dummy_func_t)replacement, (dobby_dummy_func_t*)&origin) != 0) {
+    // BepInEx/Dobby uses the classic void* signature:
+    //   int DobbyHook(void *address, void *replace_func, void **origin_func);
+    // (upstream jmpews master's dobby_dummy_func_t typedef is not present here).
+    if (DobbyHook(target, (void*)replacement, (void**)&origin) != 0) {
         LOGE("DobbyHook failed @ %p", target);
         return nullptr;
     }

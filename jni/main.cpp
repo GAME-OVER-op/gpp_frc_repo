@@ -1,5 +1,6 @@
 // Zygisk entrypoint. Реализует zygisk_module_entry / zygisk_companion_entry,
 // как в оригинальном liblybfghook.so, но без сети.
+#include <sys/types.h>   // dev_t / ino_t, required by zygisk.hpp
 #include "zygisk.hpp"
 #include "config.h"
 #include "log.h"
