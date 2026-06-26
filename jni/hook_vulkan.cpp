@@ -36,6 +36,7 @@ struct DevFns {
     PFN_vkBeginCommandBuffer    beginCmd = nullptr;
     PFN_vkCmdPipelineBarrier    barrier = nullptr;
     PFN_vkCmdCopyImageToBuffer  copyImgToBuf = nullptr;
+    PFN_vkCmdCopyBufferToImage  copyBufToImg = nullptr;
     PFN_vkEndCommandBuffer      endCmd = nullptr;
     PFN_vkQueueSubmit           submit = nullptr;
     PFN_vkCreateFence           createFence = nullptr;
@@ -77,6 +78,18 @@ struct SwapInfo {
     VkFence acqFence = VK_NULL_HANDLE;
     bool injReady = false;
     bool injLogged = false;
+    // blend interpolation (Stage 2A): CPU midpoint of prev+cur frame
+    VkBuffer dlBuf = VK_NULL_HANDLE;   // download current frame to host
+    VkBuffer ulBuf = VK_NULL_HANDLE;   // upload blended midpoint from host
+    VkDeviceMemory dlMem = VK_NULL_HANDLE;
+    VkDeviceMemory ulMem = VK_NULL_HANDLE;
+    void* dlMapped = nullptr;
+    void* ulMapped = nullptr;
+    std::vector<uint8_t> prevFrame;
+    bool hasPrev = false;
+    int blendRowBytes = 0;
+    VkDeviceSize blendBytes = 0;
+    bool blendReady = false;
 };
 
 std::mutex g_mtx;
@@ -105,6 +118,7 @@ DevFns& devFns(VkDevice dev) {
     f.beginCmd      = (PFN_vkBeginCommandBuffer)G("vkBeginCommandBuffer");
     f.barrier       = (PFN_vkCmdPipelineBarrier)G("vkCmdPipelineBarrier");
     f.copyImgToBuf  = (PFN_vkCmdCopyImageToBuffer)G("vkCmdCopyImageToBuffer");
+    f.copyBufToImg  = (PFN_vkCmdCopyBufferToImage)G("vkCmdCopyBufferToImage");
     f.endCmd        = (PFN_vkEndCommandBuffer)G("vkEndCommandBuffer");
     f.submit        = (PFN_vkQueueSubmit)G("vkQueueSubmit");
     f.createFence   = (PFN_vkCreateFence)G("vkCreateFence");
@@ -267,26 +281,58 @@ bool ensureInject(SwapInfo& sw, DevFns& f) {
     return true;
 }
 
-// Copy the just-presented image (srcIndex) into a freshly acquired swapchain
-// image and present that as an EXTRA frame. Returns true if the app's wait
-// semaphores were consumed by our submit (the caller must then present the
-// real frame WITHOUT those semaphores).
-bool injectDuplicate(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR* info, uint32_t srcIndex) {
+// Lazily build the host-visible buffers used for CPU blend interpolation:
+// dlBuf receives the current frame (image->buffer); ulBuf holds the computed
+// midpoint (buffer->image); prevFrame keeps the previous frame on the CPU.
+bool ensureBlend(SwapInfo& sw, DevFns& f) {
+    if (sw.blendReady) return true;
+    sw.blendRowBytes = (int)sw.extent.width * 4;
+    sw.blendBytes = (VkDeviceSize)sw.blendRowBytes * sw.extent.height;
+    auto mkBuf = [&](VkBufferUsageFlags usage, VkBuffer* buf, VkDeviceMemory* mem, void** mapped) -> bool {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = sw.blendBytes; bci.usage = usage; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (f.createBuf(sw.device, &bci, nullptr, buf) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr{}; f.getBufReq(sw.device, *buf, &mr);
+        int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
+        if (f.allocMem(sw.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
+        f.bindBufMem(sw.device, *buf, *mem, 0);
+        return f.mapMem(sw.device, *mem, 0, VK_WHOLE_SIZE, 0, mapped) == VK_SUCCESS;
+    };
+    if (!mkBuf(VK_BUFFER_USAGE_TRANSFER_DST_BIT, &sw.dlBuf, &sw.dlMem, &sw.dlMapped)) { LOGE("vk: blend dlBuf fail"); return false; }
+    if (!mkBuf(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sw.ulBuf, &sw.ulMem, &sw.ulMapped)) { LOGE("vk: blend ulBuf fail"); return false; }
+    sw.prevFrame.assign((size_t)sw.blendBytes, 0);
+    sw.hasPrev = false;
+    sw.blendReady = true;
+    LOGI("vk: blend ready %ux%u rowBytes=%d bytes=%llu", sw.extent.width, sw.extent.height,
+         sw.blendRowBytes, (unsigned long long)sw.blendBytes);
+    return true;
+}
+
+// STAGE 2A: synthesize an interpolated frame = midpoint of the previous and
+// current frame (CPU 50/50 blend) and present it BEFORE the real current
+// frame. Returns true if the app's wait semaphores were consumed by our
+// download submit (the caller must then present the real frame WITHOUT them).
+bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR* info, uint32_t srcIndex) {
     std::lock_guard<std::mutex> lk(g_mtx);
     auto sit = g_swaps.find(swapchain);
     if (sit == g_swaps.end()) return false;
     SwapInfo& sw = sit->second;
     DevFns& f = devFns(sw.device);
-    if (!f.ok || !f.acquireNextImage || !f.cmdCopyImage) return false;
+    if (!f.ok || !f.acquireNextImage || !f.copyImgToBuf || !f.copyBufToImg) return false;
     if (srcIndex >= sw.images.size()) return false;
     if (!ensureInject(sw, f)) return false;
+    if (!ensureBlend(sw, f)) return false;
 
-    // Acquire a destination image (CPU-wait via fence).
+    // Acquire the destination image BEFORE consuming app semaphores, so a
+    // timeout here falls back cleanly to a normal single present.
     uint32_t dstIndex = 0;
     f.resetFences(sw.device, 1, &sw.acqFence);
     VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
-        if (g_config.debug) LOGW("vk: inject acquire rc=%d", (int)ar);
+        if (g_config.debug) LOGW("vk: blend acquire rc=%d", (int)ar);
         return false;
     }
     f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
@@ -295,64 +341,73 @@ bool injectDuplicate(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInf
     VkImage src = sw.images[srcIndex];
     VkImage dst = sw.images[dstIndex];
 
-    f.resetCmd(sw.injCmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkBufferImageCopy reg{};
+    reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    reg.imageExtent = {sw.extent.width, sw.extent.height, 1};
+
+    // ---- Submit #1: download current frame (src) into dlBuf. Waits on (and
+    // consumes) the app's render semaphores so src is fully drawn. ----
+    f.resetCmd(sw.injCmd, 0);
     f.beginCmd(sw.injCmd, &bi);
-
-    VkImageMemoryBarrier pre[2] = {};
-    pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    pre[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    pre[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    pre[0].image = src;
-    pre[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    pre[1] = pre[0];
-    pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    pre[1].srcAccessMask = 0;
-    pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    pre[1].image = dst;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, pre);
-
-    VkImageCopy region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.srcOffset = {0, 0, 0}; region.dstOffset = {0, 0, 0};
-    region.extent = {sw.extent.width, sw.extent.height, 1};
-    f.cmdCopyImage(sw.injCmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    VkImageMemoryBarrier post[2] = {};
-    post[0] = pre[0];
-    post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    post[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    post[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    post[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    post[0].image = src;
-    post[1] = post[0];
-    post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    post[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    post[1].image = dst;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, post);
+    b.image = src;
+    b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;   b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    f.copyImgToBuf(sw.injCmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sw.dlBuf, 1, &reg);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     f.endCmd(sw.injCmd);
 
-    // Wait on the app's render-finished semaphores so src is fully drawn. This
-    // consumes them, so the real present must not wait on them again.
     std::vector<VkPipelineStageFlags> waitStages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = info->waitSemaphoreCount;
     si.pWaitSemaphores = info->pWaitSemaphores;
     si.pWaitDstStageMask = info->waitSemaphoreCount ? waitStages.data() : nullptr;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &sw.injCmd;
+    si.commandBufferCount = 1; si.pCommandBuffers = &sw.injCmd;
     f.resetFences(sw.device, 1, &sw.injFence);
-    if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: inject submit fail"); return false; }
+    if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: blend download submit fail"); return false; }
+    // App semaphores are now consumed -> we are committed to returning true.
     f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
 
-    // Present the duplicate; the real frame follows (caller).
+    // ---- CPU blend: out = (prev + cur) / 2 (channel order irrelevant) ----
+    const uint8_t* cur = (const uint8_t*)sw.dlMapped;
+    uint8_t* out = (uint8_t*)sw.ulMapped;
+    size_t n = (size_t)sw.blendBytes;
+    if (sw.hasPrev) {
+        const uint8_t* prev = sw.prevFrame.data();
+        for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)((prev[i] + cur[i] + 1) >> 1);
+    } else {
+        memcpy(out, cur, n);  // no history on the first frame -> duplicate
+    }
+    memcpy(sw.prevFrame.data(), cur, n);
+    sw.hasPrev = true;
+
+    // ---- Submit #2: upload the midpoint (ulBuf) into the dst image ----
+    f.resetCmd(sw.injCmd, 0);
+    f.beginCmd(sw.injCmd, &bi);
+    b.image = dst;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = 0;                     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    f.copyBufToImg(sw.injCmd, sw.ulBuf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    f.endCmd(sw.injCmd);
+    VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si2.commandBufferCount = 1; si2.pCommandBuffers = &sw.injCmd;
+    f.resetFences(sw.device, 1, &sw.injFence);
+    if (f.submit(queue, 1, &si2, sw.injFence) == VK_SUCCESS)
+        f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
+
+    // Present the interpolated midpoint; the caller presents the real frame.
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
@@ -360,7 +415,7 @@ bool injectDuplicate(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInf
     orig_QueuePresent(queue, &pi);
 
     if (!sw.injLogged) {
-        LOGI("vk: present-bridge active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
+        LOGI("vk: blend interpolation active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
         sw.injLogged = true;
     }
     return true;
@@ -407,12 +462,11 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
 
 VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
     if (info) {
-        // STAGE 1 present-bridge: inject a duplicate frame to double the present
-        // rate, proving extra frames can be pushed through the game's own
-        // swapchain (root FPS tool should read ~2x). Stage 2 replaces the
-        // duplicate source with the engine's interpolated output.
+        // STAGE 2A present-bridge: synthesize an interpolated midpoint frame
+        // (CPU blend of the previous and current frame) and present it BEFORE
+        // the real current frame, for genuinely smoother perceived motion.
         if (g_config.present_bridge && info->swapchainCount == 1) {
-            bool consumed = injectDuplicate(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
+            bool consumed = injectBlend(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
             if (consumed) {
                 VkPresentInfoKHR real = *info;
                 real.waitSemaphoreCount = 0;

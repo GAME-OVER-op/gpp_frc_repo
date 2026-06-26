@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.7.1-pbridge
-versionCode=8
+version=v0.8.0-blend
+versionCode=9
 author=clean-room
-description=Clean Zygisk FRC hook (present-bridge frame injection stage 1; no network)
+description=Clean Zygisk FRC hook (present-bridge blend interpolation stage 2A; no network)
