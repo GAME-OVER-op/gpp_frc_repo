@@ -61,12 +61,14 @@ target_include_directories(lybfghook PRIVATE ${HOOK_INCLUDE})
 # SONAME/output name like the original, so it is drop-in compatible.
 set_target_properties(lybfghook PROPERTIES OUTPUT_NAME "lybfghook")
 
-# NOTE: there is no libGLESv3.so in the Android NDK. GLES 3.x entry points are
-# exported by libGLESv2.so, so we link GLESv2 only. Linking GLESv3 here would
-# fail at link time (-lGLESv3 not found) under -Wl,--no-undefined --fatal-warnings.
+# GLES linkage: frame_gen.cpp uses GLES 3.0 VAO entry points
+# (glGenVertexArrays/glBindVertexArray/glDeleteVertexArrays). Those are exported
+# by the NDK's libGLESv3.so stub, NOT by libGLESv2.so (which only provides GLES 2.0
+# symbols). We link both: GLESv3 for 3.x entry points, GLESv2 for the 2.0 core.
 target_link_libraries(lybfghook
     ${HOOK_LIB}
     EGL
+    GLESv3
     GLESv2
     log
     android
