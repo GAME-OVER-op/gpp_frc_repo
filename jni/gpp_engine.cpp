@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <vector>
 #include <android/dlext.h>
 
 namespace cleanfg {
@@ -158,6 +160,48 @@ const char* GPP_CORE_ALLOW =
     "libui.so:libgui.so:libnativewindow.so:libsync.so:libhardware.so:"
     "libhidlbase.so:libvndksupport.so";
 
+// Bounded recursive scan: collect absolute paths of files whose name contains
+// `needle`. Used to locate the engine and its vendor dependency wherever the
+// OEM actually shipped them (filename/path can differ from the DT_SONAME).
+int g_scanBudget = 0;
+void scanForLib(const std::string& root, const char* needle,
+                std::vector<std::string>& out, int depth) {
+    if (depth < 0 || out.size() >= 12 || g_scanBudget <= 0) return;
+    DIR* d = opendir(root.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) && out.size() < 12 && g_scanBudget > 0) {
+        if (e->d_name[0] == '.') continue;
+        --g_scanBudget;
+        std::string p = root + "/" + e->d_name;
+        bool isDir = (e->d_type == DT_DIR);
+        if (e->d_type == DT_UNKNOWN) {  // some fs don't fill d_type
+            DIR* t = opendir(p.c_str());
+            if (t) { isDir = true; closedir(t); }
+        }
+        if (isDir) {
+            scanForLib(p, needle, out, depth - 1);
+        } else if (strstr(e->d_name, needle) && strstr(e->d_name, ".so")) {
+            out.push_back(p);
+        }
+    }
+    closedir(d);
+}
+
+// Find candidate files for `needle` across the lib partitions (incl. apex).
+std::vector<std::string> findLibFiles(const char* needle) {
+    std::vector<std::string> out;
+    const char* roots[] = {
+        "/vendor/lib64", "/odm/lib64", "/vendor/lib64/hw", "/odm/lib64/hw",
+        "/system/lib64", "/system_ext/lib64", "/product/lib64",
+    };
+    g_scanBudget = 6000;
+    for (const char* r : roots) scanForLib(r, needle, out, 2);
+    // apex trees (VNDK / vendor HALs are increasingly shipped here)
+    scanForLib("/apex", needle, out, 4);
+    return out;
+}
+
 // Build (once) a permissive namespace that can see system + vendor at once.
 struct android_namespace_t* createGppNamespace(bool first) {
     static struct android_namespace_t* cached = nullptr;
@@ -197,25 +241,60 @@ void* loadEngineViaCustomNs(bool first) {
     info.flags = ANDROID_DLEXT_USE_NAMESPACE;
     info.library_namespace = ns;
 
-    // Pre-load the vendor dependency first for a precise failure point. Once it
-    // is resolved inside this namespace, the engine's DT_NEEDED is satisfied by
-    // soname without re-searching the (forbidden-for-vendor) /system paths.
-    const char* deps[] = {
-        "vendor.qti.hardware.vpp-V1-ndk.so",
-        "vendor.qti.hardware.vpp-V1-ndk_platform.so",
-        "vendor.qti.hardware.vpp-V1.0-ndk.so",
-    };
-    for (const char* d : deps) {
-        void* dep = android_dlopen_ext(d, RTLD_NOW | RTLD_GLOBAL, &info);
-        if (dep) { LOGI("gpp: preloaded vendor dep %s", d); break; }
-        if (first) { const char* e = dlerror(); LOGW("gpp: dep '%s': %.120s", d, e ? e : "?"); }
+    FnGetNs getNs = (FnGetNs)dlsym(RTLD_DEFAULT, "android_get_exported_namespace");
+
+    // STEP 1: preload the vendor VPP libraries through the *sphal* namespace.
+    // An app-created namespace is NOT permitted to read /vendor/lib64 even with
+    // it on the search path (that is why the earlier "not found" happened even
+    // though the file is present). The platform 'sphal' namespace IS allowed to
+    // load /vendor libs, so we load them there, by ABSOLUTE PATH, RTLD_GLOBAL.
+    // Our engine namespace is linked to sphal for these sonames, so when the
+    // engine's DT_NEEDED fires the linker reuses the copy already loaded here.
+    struct android_namespace_t* sphal = getNs ? getNs("sphal") : nullptr;
+    int vendorLoaded = 0;
+    if (sphal) {
+        android_dlextinfo si; memset(&si, 0, sizeof(si));
+        si.flags = ANDROID_DLEXT_USE_NAMESPACE;
+        si.library_namespace = sphal;
+        // Load low-level vpp libs first, then the AIDL HAL wrapper last so its
+        // own DT_NEEDED (libvppclient/...) are already satisfied in-namespace.
+        const char* order[] = {
+            "libvppcommon", "libvpplibrary", "libvpphcp", "libvpphvx",
+            "libvppimmotion", "libvppclient", "hardware.vpp",
+        };
+        for (const char* needle : order) {
+            for (const std::string& d : findLibFiles(needle)) {
+                // skip the versioned @1.x hidl libs; we want the AIDL -ndk one
+                if (!strcmp(needle, "hardware.vpp") && !strstr(d.c_str(), "-ndk")) continue;
+                void* h = android_dlopen_ext(d.c_str(), RTLD_NOW | RTLD_GLOBAL, &si);
+                if (h) { ++vendorLoaded; LOGI("gpp: sphal preload ok %s", d.c_str()); }
+                else if (first) { const char* e = dlerror(); LOGW("gpp: sphal preload '%s': %.120s", d.c_str(), e ? e : "?"); }
+            }
+        }
+    } else if (first) {
+        LOGW("gpp: sphal namespace unavailable for vendor preload");
+    }
+    if (!vendorLoaded && first)
+        LOGW("gpp: no vendor vpp lib preloaded -- engine link will likely fail");
+
+    // STEP 2: preload the engine's /system-side helper (libgpppreprocessing.so),
+    // which lives in /system and is reachable from our (system-capable) ns.
+    for (const std::string& d : findLibFiles("libgpppreprocessing")) {
+        void* h = android_dlopen_ext(d.c_str(), RTLD_NOW | RTLD_GLOBAL, &info);
+        if (h) { LOGI("gpp: preload ok %s", d.c_str()); }
+        else if (first) { const char* e = dlerror(); LOGW("gpp: preload '%s': %.120s", d.c_str(), e ? e : "?"); }
     }
 
-    for (const char* c : LIB_CANDIDATES) {
-        if (c[0] != '/') continue;  // namespace load needs an absolute path
-        void* h = android_dlopen_ext(c, RTLD_NOW | RTLD_GLOBAL, &info);
-        if (h) { LOGI("gpp: dlopen_ext ok via custom ns: %s", c); return h; }
-        if (first) { const char* e = dlerror(); LOGW("gpp: custom ns '%s': %.120s", c, e ? e : "?"); }
+    // Build the engine candidate list: known paths first, then anything the
+    // filesystem scan turned up.
+    std::vector<std::string> engines;
+    for (const char* c : LIB_CANDIDATES) if (c[0] == '/') engines.push_back(c);
+    auto found = findLibFiles("libgppvppgfrcplussession");
+    engines.insert(engines.end(), found.begin(), found.end());
+    for (const std::string& c : engines) {
+        void* h = android_dlopen_ext(c.c_str(), RTLD_NOW | RTLD_GLOBAL, &info);
+        if (h) { LOGI("gpp: dlopen_ext ok via custom ns: %s", c.c_str()); return h; }
+        if (first) { const char* e = dlerror(); LOGW("gpp: custom ns '%s': %.120s", c.c_str(), e ? e : "?"); }
     }
     return nullptr;
 }
