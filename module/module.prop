@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.1.0
-versionCode=1
+version=v0.2.0-gppengine
+versionCode=2
 author=clean-room
-description=Clean Zygisk frame-generation hook (no network, no analytics)
+description=Clean Zygisk FRC hook (GPPSession vendor-engine client, no network)

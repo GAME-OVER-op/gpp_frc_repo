@@ -47,6 +47,7 @@ add_library(lybfghook SHARED
     hook_engine.cpp
     hook_egl.cpp
     hook_vulkan.cpp
+    gpp_engine.cpp
     frame_gen.cpp
     config.cpp
     display_rate.cpp
@@ -70,6 +71,7 @@ target_link_libraries(lybfghook
     EGL
     GLESv3
     GLESv2
+    vulkan
     log
     android
 )

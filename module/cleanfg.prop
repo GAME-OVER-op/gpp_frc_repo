@@ -1,28 +1,8 @@
-# Список целевых пакетов через запятую.
-# Безопасно: укажи конкретную игру, например:
-# target_packages=com.tencent.ig,com.miHoYo.GenshinImpact
-# Для всех приложений: target_packages=*  (НЕ рекомендуется: может ломать UI/лаунчер/камеру)
-target_packages=com.example.game
-
-# auto | gles | vulkan
-# Сейчас рабочий путь — GLES/EGL. Vulkan пока каркас.
-mode=gles
-
-# 2 = 60 -> 120 / 72 -> 144, если панель и ОС разрешат
+target_packages=com.miHoYo.GenshinImpact
+mode=vulkan
 multiplier=2
-
-# 0 = auto, Android сам ограничит до доступной частоты панели.
-# Можно поставить 120 или 144.
 max_fps=0
-
-# Просить у Android повышенную частоту экрана через ANativeWindow_setFrameRate
 elevate_rate=1
-
-# Пытаться убрать vsync-lock приложения через eglSwapInterval(0)
 force_swap_interval_0=1
-
-# blend = базовая интерполяция между двумя кадрами
 method=blend
-
-# logcat tag: cleanfg
-debug=0
+debug=1
