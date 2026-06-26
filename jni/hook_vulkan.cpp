@@ -8,7 +8,9 @@
 #include "gpp_engine.h"
 #include "config.h"
 #include "log.h"
+#include "display_rate.h"
 #include <dlfcn.h>
+#define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
 #include <unordered_map>
 #include <vector>
@@ -65,16 +67,20 @@ struct SwapInfo {
     int rowBytes = 0;
     bool capReady = false;
     bool engineConnected = false;
+    void* window = nullptr;       // ANativeWindow* captured from vkCreateAndroidSurfaceKHR
+    bool rateRequested = false;
 };
 
 std::mutex g_mtx;
 std::unordered_map<VkDevice, DevFns> g_devs;
 std::unordered_map<VkSwapchainKHR, SwapInfo> g_swaps;
 std::unordered_map<VkDevice, VkPhysicalDevice> g_devPhys;
+std::unordered_map<VkSurfaceKHR, void*> g_surfWindow;  // VkSurfaceKHR -> ANativeWindow*
 
 PFN_vkCreateSwapchainKHR orig_CreateSwapchain = nullptr;
 PFN_vkQueuePresentKHR    orig_QueuePresent = nullptr;
 PFN_vkCreateDevice       orig_CreateDevice = nullptr;
+PFN_vkCreateAndroidSurfaceKHR orig_CreateAndroidSurface = nullptr;
 
 bool isBGRA(VkFormat f) {
     return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB;
@@ -216,8 +222,18 @@ void captureAndSubmit(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageInd
         std::string layer = "SurfaceView[" + pkg + "]#0";
         sw.engineConnected = g_engine.connect(pkg, layer, (int)sw.extent.width, (int)sw.extent.height);
     }
-    if (sw.engineConnected)
+    if (sw.engineConnected) {
+        // Elevate the panel refresh rate so the generated (interpolated) frames
+        // have somewhere to be shown. Genshin caps at 60; request 60*multiplier
+        // (or max_fps). The OS clamps the request to a real supported panel mode.
+        if (sw.window && !sw.rateRequested) {
+            float target = g_config.max_fps > 0 ? (float)g_config.max_fps
+                                                : 60.0f * (float)g_config.multiplier;
+            requestFrameRateForWindow(sw.window, target);
+            sw.rateRequested = true;
+        }
         g_engine.submitFrameRGBA(sw.mapped, (int)sw.extent.width, (int)sw.extent.height, sw.rowBytes);
+    }
 }
 
 // ---- hooks ----
@@ -229,6 +245,7 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
         DevFns& f = devFns(device);
         SwapInfo sw;
         sw.device = device; sw.format = ci->imageFormat; sw.extent = ci->imageExtent;
+        { auto wit = g_surfWindow.find(ci->surface); if (wit != g_surfWindow.end()) sw.window = wit->second; }
         if (f.getSwapImages) {
             uint32_t n = 0; f.getSwapImages(device, *out, &n, nullptr);
             sw.images.resize(n);
@@ -256,6 +273,19 @@ VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
     if (r == VK_SUCCESS && out && *out) {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_devPhys[*out] = phys;
+    }
+    return r;
+}
+
+// Capture the ANativeWindow backing each Android Vulkan surface so we can later
+// elevate the panel refresh rate on the matching swapchain.
+VkResult my_CreateAndroidSurface(VkInstance inst, const VkAndroidSurfaceCreateInfoKHR* ci,
+                                 const VkAllocationCallbacks* alloc, VkSurfaceKHR* out) {
+    VkResult r = orig_CreateAndroidSurface(inst, ci, alloc, out);
+    if (r == VK_SUCCESS && out && *out && ci) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_surfWindow[*out] = (void*)ci->window;
+        LOGI("vk: android surface %p window=%p", (void*)*out, (void*)ci->window);
     }
     return r;
 }
@@ -296,6 +326,10 @@ PFN_vkVoidFunction VKAPI_PTR my_GetInstanceProcAddr(VkInstance inst, const char*
     if (!strcmp(name, "vkCreateDevice")) {
         if (real) orig_CreateDevice = (PFN_vkCreateDevice)real;
         return (PFN_vkVoidFunction)my_CreateDevice;
+    }
+    if (!strcmp(name, "vkCreateAndroidSurfaceKHR")) {
+        if (real) orig_CreateAndroidSurface = (PFN_vkCreateAndroidSurfaceKHR)real;
+        return (PFN_vkVoidFunction)my_CreateAndroidSurface;
     }
     if (!real) return nullptr;
     if (!strcmp(name, "vkCreateSwapchainKHR")) {
@@ -338,6 +372,8 @@ bool installVulkanHook() {
     void* createDev  = dlsym(libvk, "vkCreateDevice");
     void* createSwap = dlsym(libvk, "vkCreateSwapchainKHR");
     void* present    = dlsym(libvk, "vkQueuePresentKHR");
+    void* createAndroidSurf = dlsym(libvk, "vkCreateAndroidSurfaceKHR");
+    if (createAndroidSurf) { void* t = hookFunction(createAndroidSurf, (void*)my_CreateAndroidSurface); if (t && !orig_CreateAndroidSurface) orig_CreateAndroidSurface = (PFN_vkCreateAndroidSurfaceKHR)t; }
     if (createDev)  { void* t = hookFunction(createDev,  (void*)my_CreateDevice);    if (t && !orig_CreateDevice)    orig_CreateDevice    = (PFN_vkCreateDevice)t; }
     if (createSwap) { void* t = hookFunction(createSwap, (void*)my_CreateSwapchain); if (t && !orig_CreateSwapchain) orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)t; }
     if (present)    { void* t = hookFunction(present,    (void*)my_QueuePresent);    if (t && !orig_QueuePresent)    orig_QueuePresent    = (PFN_vkQueuePresentKHR)t; }

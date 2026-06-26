@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.4.0-engineload
-versionCode=4
+version=v0.6.0-present
+versionCode=6
 author=clean-room
-description=Clean Zygisk FRC hook (GPPSession vendor-engine client, no network)
+description=Clean Zygisk FRC hook (GPPSession vendor-engine client; SELinux relax + 120Hz elevation; no network)

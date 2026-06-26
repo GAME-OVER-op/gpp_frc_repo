@@ -95,4 +95,25 @@ void requestBestFrameRate(EGLSurface surface, float measuredGameFps) {
     g_lastRequested = target;
     LOGI("requested display frameRate %.1f for measured game %.1f, result=%d", target, measuredGameFps, r);
 }
+
+// Vulkan path: request a fixed target rate directly on a swapchain's
+// ANativeWindow (no EGLSurface map). Used by the Vulkan present hook so the
+// panel runs at the elevated rate and the generated frames can be shown.
+void requestFrameRateForWindow(void* nativeWindow, float targetFps) {
+    if (!g_config.elevate_rate) return;
+    if (!nativeWindow || targetFps < 30.0f) return;
+    std::call_once(g_resolveOnce, resolveFrameRateApis);
+    if (!g_setFrameRate && !g_setFrameRateWithStrategy) return;
+    ANativeWindow* w = reinterpret_cast<ANativeWindow*>(nativeWindow);
+    int r = 0;
+    if (g_setFrameRateWithStrategy) {
+        r = g_setFrameRateWithStrategy(w, targetFps,
+            ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+            ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS);
+    } else {
+        r = g_setFrameRate(w, targetFps,
+            ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+    }
+    LOGI("vk: requested display frameRate %.1f result=%d", targetFps, r);
+}
 }
