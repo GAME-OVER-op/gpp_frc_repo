@@ -19,7 +19,7 @@
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
 #include "interop_bench.h"
 #include "extrap_bench.h"
-#include "extrap_dump.h"
+#include "extrap_eval.h"
 #include <atomic>
 
 namespace cleanfg {
@@ -308,7 +308,7 @@ void captureAndSubmit(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageInd
 }
 
 // One-shot diagnostic helper: copy a swapchain image into a tightly-packed
-// host RGBA buffer (used by the extrap-dump real-frame validation). Reuses the
+// host RGBA buffer (used by the extrap-eval real-frame test). Reuses the
 // capture buffer/fence. Returns false on any failure.
 bool captureToHost(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageIndex,
                    std::vector<uint8_t>& out, uint32_t& wOut, uint32_t& hOut) {
@@ -320,7 +320,6 @@ bool captureToHost(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageIndex,
     if (!f.ok) return false;
     if (imageIndex >= sw.images.size()) return false;
     if (!ensureCapture(sw, f, 0)) return false;
-
     VkImage img = sw.images[imageIndex];
     f.resetCmd(sw.cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -533,24 +532,35 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     if (!ensureInject(sw, f)) return false;
     if (!ensureGpuBlend(sw, f)) return false;
 
-    // Acquire the destination image BEFORE consuming app semaphores, so a
-    // timeout here falls back cleanly to a normal single present.
-    uint32_t dstIndex = 0;
-    f.resetFences(sw.device, 1, &sw.acqFence);
-    VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
-    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
-        if (g_config.debug) LOGW("vk: blend acquire rc=%d", (int)ar);
-        return false;
+    int mult = g_config.multiplier;
+    if (mult < 2) mult = 2;
+    if (mult > 8) mult = 8;
+    const int inserts = mult - 1;          // synthetic frames shown before the real one
+    const int want = sw.gHasPrev ? inserts : 1;
+
+    // Acquire all destination images up front (cheap; no GPU work). We hold them
+    // until after one combined submit, then present them in order so FIFO paces
+    // them across vsyncs. Bail cleanly to a normal present on any failure.
+    uint32_t dstIdx[8];
+    int got = 0;
+    for (int k = 0; k < want; ++k) {
+        uint32_t di = 0;
+        f.resetFences(sw.device, 1, &sw.acqFence);
+        VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &di);
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            if (g_config.debug) LOGW("vk: blend acquire[%d] rc=%d", k, (int)ar);
+            break;
+        }
+        f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
+        if (di >= sw.images.size()) break;
+        dstIdx[got++] = di;
     }
-    f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
-    if (dstIndex >= sw.images.size()) return false;
+    if (got < want) return false;
 
     VkImage src = sw.images[srcIndex];
-    VkImage dst = sw.images[dstIndex];
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
     auto imgBar = [&](VkImage img, VkImageLayout o, VkImageLayout n,
                       VkAccessFlags sa, VkAccessFlags da,
                       VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
@@ -570,7 +580,7 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     f.resetCmd(sw.injCmd, 0);
     f.beginCmd(sw.injCmd, &bi);
 
-    // (1) Copy the freshly-rendered swapchain image (src) into our gCur image.
+    // (A) Copy the freshly-rendered swapchain image (src) into gCur.
     imgBar(src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -582,12 +592,15 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     imgBar(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     if (!sw.gHasPrev) {
-        // First frame: no history yet. Seed gPrev = cur and present a duplicate.
-        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // No history yet: seed gPrev = cur and present a single duplicate.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         imgBar(sw.gPrev, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                0, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -596,43 +609,50 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
         imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VkImage d0 = sw.images[dstIdx[0]];
+        imgBar(d0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                0, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                       d0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(d0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         sw.gHasPrev = true;
     } else {
-        // gCur -> GENERAL (compute reads), gOut -> GENERAL (compute writes). gPrev already GENERAL.
-        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-               0, VK_ACCESS_SHADER_WRITE_BIT,
-               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
-        f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
-        BlendPC pc{ g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
-                   g_config.motion_strength, g_config.blur_radius };
-        f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
-        uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
-        f.cmdDispatch(sw.injCmd, gx, gy, 1);
-        // gOut -> TRANSFER_SRC, dst -> TRANSFER_DST, copy interpolated midpoint into dst.
-        imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-               0, VK_ACCESS_TRANSFER_WRITE_BIT,
-               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
-               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        // History update: gCur -> gPrev (both currently GENERAL), leave gPrev GENERAL.
+        // (B) Produce `inserts` interpolated frames at alpha = k/mult into each dst.
+        for (int k = 1; k <= inserts; ++k) {
+            float alpha = (float)k / (float)mult;
+            if (k == 1) {
+                imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                       0, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            } else {
+                imgBar(sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            }
+            f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
+            f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
+            BlendPC pc{ alpha, g_config.diff_threshold, g_config.diff_softness,
+                       g_config.motion_strength, g_config.blur_radius };
+            f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
+            uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
+            f.cmdDispatch(sw.injCmd, gx, gy, 1);
+            imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImage dk = sw.images[dstIdx[k-1]];
+            imgBar(dk, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           dk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+            imgBar(dk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
+        // History: gCur -> gPrev (both GENERAL), restore gPrev to GENERAL.
         imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -658,14 +678,17 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: blend submit fail"); return false; }
     f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
 
-    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &swapchain;
-    pi.pImageIndices = &dstIndex;
-    orig_QueuePresent(queue, &pi);
+    // Present the synthetic frame(s) in order; FIFO paces them across vsyncs.
+    for (int k = 0; k < got; ++k) {
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain;
+        pi.pImageIndices = &dstIdx[k];
+        orig_QueuePresent(queue, &pi);
+    }
 
     if (!sw.injLogged) {
-        LOGI("vk: gpu-blend interpolation active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
+        LOGI("vk: gpu-blend interpolation active mult=%d inserts=%d src=%u %ux%u", mult, inserts, srcIndex, sw.extent.width, sw.extent.height);
         sw.injLogged = true;
     }
     return true;
@@ -683,7 +706,8 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
         mci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         // Need spare images so we can hold one extra in-flight frame for
         // injection without starving the game's own acquire/present loop.
-        mci.minImageCount = origMin + 4;
+        int spare = g_config.multiplier; if (spare < 2) spare = 2; if (spare > 8) spare = 8;
+        mci.minImageCount = origMin + spare + 2;
     }
     VkResult r = orig_CreateSwapchain(device, &mci, alloc, out);
     if (r != VK_SUCCESS && g_config.present_bridge) {
@@ -745,38 +769,39 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
             if (bw && bh) runExtrapBenchmark(bw, bh, 120);
         }
     }
-    // STAGE 2 one-shot real-frame extrapolation dump (opt-in via extrap_dump=1).
-    // Warms up, then captures two real consecutive frames to host, runs ME on a
-    // worker GL context, and writes prev/cur/out PPMs. Skips injection meanwhile.
-    if (info && info->swapchainCount == 1 && g_config.extrap_dump) {
-        static std::atomic<int> dumpState{0};   // 0=warmup,1=have frame1,2=done
+    // STAGE 2 one-shot objective ME evaluation (opt-in via extrap_eval=1).
+    // Collects 3 spaced real frames, but only fires once there is real motion
+    // between them; predicts F2 from (F0,F1) and logs prediction error vs the
+    // duplicate-frame baseline. Pure logcat, no files. Skips injection meanwhile.
+    if (info && info->swapchainCount == 1 && g_config.extrap_eval) {
+        static std::atomic<int> evalDone{0};
         static std::atomic<int> seen{0};
-        static std::vector<uint8_t> prevCpu;
-        static uint32_t pw = 0, ph = 0;
-        if (dumpState.load() < 2) {
-            int st = dumpState.load();
+        static std::vector<uint8_t> f0, f1, f2;
+        static uint32_t ew = 0, eh = 0;
+        if (!evalDone.load()) {
             int n = seen.fetch_add(1) + 1;
-            const int kWarmup = 240, kGap = 12;
-            if (st == 0 && n >= kWarmup) {
+            const int kWarmup = 120, kSample = 5;
+            if (n >= kWarmup && (n % kSample) == 0) {
                 std::vector<uint8_t> cur; uint32_t w = 0, h = 0;
                 if (captureToHost(queue, info->pSwapchains[0], info->pImageIndices[0], cur, w, h)) {
-                    prevCpu = std::move(cur); pw = w; ph = h;
-                    seen.store(0); dumpState.store(1);
-                    LOGI("extrap-dump: captured real frame 1 (%ux%u); keep moving", w, h);
-                }
-            } else if (st == 1 && n >= kGap) {
-                std::vector<uint8_t> cur; uint32_t w = 0, h = 0;
-                if (captureToHost(queue, info->pSwapchains[0], info->pImageIndices[0], cur, w, h)) {
-                    if (w == pw && h == ph) {
-                        std::string pkg = g_config.target_packages.empty()
-                            ? std::string("com.miHoYo.GenshinImpact") : g_config.target_packages.front();
-                        std::string dir = std::string("/data/data/") + pkg + "/";
-                        LOGI("extrap-dump: captured real frame 2 (%ux%u); running ME + writing PPMs to %s", w, h, dir.c_str());
-                        runExtrapDump(std::move(prevCpu), std::move(cur), w, h, dir);
-                        dumpState.store(2);
-                    } else {
-                        prevCpu = std::move(cur); pw = w; ph = h; seen.store(0);
-                        LOGW("extrap-dump: resolution changed, recapturing frame1 (%ux%u)", w, h);
+                    if (!f2.empty() && (w != ew || h != eh)) { f0.clear(); f1.clear(); f2.clear(); }
+                    ew = w; eh = h;
+                    f0 = std::move(f1); f1 = std::move(f2); f2 = std::move(cur);
+                    if (!f0.empty() && !f1.empty() && !f2.empty()) {
+                        auto mad = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+                            size_t nn = a.size() < b.size() ? a.size() : b.size();
+                            double acc = 0.0; size_t c = 0;
+                            for (size_t i = 0; i + 4 <= nn; i += 64) { int d = (int)a[i] - (int)b[i]; acc += d < 0 ? -d : d; ++c; }
+                            return c ? acc / (double)c : 0.0;
+                        };
+                        double m01 = mad(f0, f1), m12 = mad(f1, f2);
+                        if (m01 >= 2.0 && m12 >= 2.0) {
+                            LOGI("extrap-eval: 3 real frames with motion (m01=%.2f m12=%.2f %ux%u); evaluating", m01, m12, ew, eh);
+                            runExtrapEval(std::move(f0), std::move(f1), std::move(f2), ew, eh);
+                            evalDone.store(1);
+                        } else if (g_config.debug) {
+                            LOGI("extrap-eval: waiting for motion (m01=%.2f m12=%.2f)", m01, m12);
+                        }
                     }
                 }
             }

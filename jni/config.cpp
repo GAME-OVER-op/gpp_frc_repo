@@ -91,8 +91,8 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "extrap_bench") {
             g_config.extrap_bench = (val == "1" || val == "true");
         
-        } else if (key == "extrap_dump") {
-            g_config.extrap_dump = (val == "1" || val == "true");
+        } else if (key == "extrap_eval") {
+            g_config.extrap_eval = (val == "1" || val == "true");
         }
     }
 
@@ -105,7 +105,7 @@ static void parseConfigText(const std::string& content) {
          g_config.motion_strength, g_config.blur_radius);
     LOGI("interop_bench=%d", g_config.interop_bench);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
-    LOGI("extrap_dump=%d", g_config.extrap_dump);
+    LOGI("extrap_eval=%d", g_config.extrap_eval);
 }
 
 // Read an entire fd to EOF and parse it. Works for both a regular file fd

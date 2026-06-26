@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.9.10-extrapdump
-versionCode=17
+version=v0.9.12-multiframe
+versionCode=19
 author=clean-room
 description=Clean Zygisk FRC hook (adaptive GPU blend; Stage 2 Vulkan<->GL AHB interop benchmark, opt-in; no network)
