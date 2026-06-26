@@ -1,0 +1,6 @@
+id=cleanfg
+name=cleanfg
+version=v0.1.0
+versionCode=1
+author=clean-room
+description=Clean Zygisk frame-generation hook (no network, no analytics)

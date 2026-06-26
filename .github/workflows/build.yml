@@ -1,0 +1,90 @@
+name: Build cleanfg Magisk module
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          set -eux
+          yes | sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" >/dev/null
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Fetch official Zygisk API header
+        run: |
+          set -eux
+          URL1="https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp"
+          URL2="https://raw.githubusercontent.com/Dr-TSNG/ZygiskNext/master/module/src/main/cpp/zygisk.hpp"
+          if curl -fsSL "$URL1" -o jni/zygisk.hpp && grep -q REGISTER_ZYGISK_MODULE jni/zygisk.hpp; then
+            echo "Fetched zygisk.hpp from sample repo"
+          elif curl -fsSL "$URL2" -o jni/zygisk.hpp && grep -q REGISTER_ZYGISK_MODULE jni/zygisk.hpp; then
+            echo "Fetched zygisk.hpp from fallback repo"
+          else
+            echo "::error::Could not fetch a valid zygisk.hpp"
+            exit 1
+          fi
+          head -5 jni/zygisk.hpp
+
+      - name: Build native module for each ABI
+        run: |
+          set -eux
+          mkdir -p module/zygisk
+          for ABI in arm64-v8a armeabi-v7a; do
+            cmake -S jni -B "build/$ABI" \
+              -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM=android-26 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build/$ABI" --config Release -j"$(nproc)"
+            cp "build/$ABI/liblybfghook.so" "module/zygisk/$ABI.so"
+            "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "module/zygisk/$ABI.so" || true
+          done
+          ls -la module/zygisk
+
+      - name: Package Magisk module zip
+        run: |
+          set -eux
+          rm -f cleanfg-magisk.zip
+          cd module
+          zip -qr ../cleanfg-magisk.zip . -x "README_INSTALL.txt"
+          cd ..
+          unzip -l cleanfg-magisk.zip
+
+      - name: Upload Magisk module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanfg-magisk
+          path: cleanfg-magisk.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach zip to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cleanfg-magisk.zip

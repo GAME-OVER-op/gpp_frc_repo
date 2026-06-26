@@ -1,84 +1,127 @@
-# lybfghook static analysis starter
+# cleanfg — clean-room Zygisk frame-generation hook
 
-Этот репозиторий — минимальная заготовка для загрузки `lybfghook` Zygisk `.so` в GitHub и последующего анализа в Ghidra/Rizin/IDA.
+Чистая реализация Zygisk-модуля генерации кадров (frame generation) **без какой-либо
+сетевой активности, аналитики, лицензий и удалённого конфига**.
 
-## Что внутри
+Проект — clean-room: код написан с нуля по наблюдаемой архитектуре оригинального
+`lybfghook`, без копирования его бинарного кода.
 
-- `binaries/arm64-v8a.so` — AArch64 Zygisk module, stripped ELF, SONAME `liblybfghook.so`.
-- `binaries/armeabi-v7a.so` — ARMv7 Zygisk module, stripped ELF.
-- `notes/module.prop`, `notes/lyb.prop` — свойства Magisk/Zygisk-модуля.
-- `scripts/basic_static.sh` — быстрый сбор строк, импортов, секций, зависимостей.
-- `scripts/ghidra_headless.sh` — пример запуска headless Ghidra и экспорта decompile/C.
+## Что установлено про оригинал (факты из статического анализа)
 
-## Предварительные выводы
+- Это Zygisk-модуль: экспортирует `zygisk_module_entry` и `zygisk_companion_entry`.
+- `liblybfghook.so` **NEEDED-линкуется** с `libEGL.so`, `libGLESv2.so`, `libGLESv3.so`,
+  `liblog.so`, `libm.so`, `libdl.so`, `libc.so` — то есть принудительно затягивает
+  графические библиотеки в адресное пространство процесса игры.
+- В бинарнике **нет** импортов `gl*`/`egl*`/`vk*` через PLT и нет их имён в открытом виде —
+  значит цели находятся и патчатся в рантайме, а не вызываются напрямую.
+- Присутствует C++ класс инлайн-хук-движка `FunctionInlineHookRouting` плюс типичные
+  примитивы инлайн-хукинга: `dl_iterate_phdr`, `/proc/self/maps`, `mprotect`, `mmap`,
+  `munmap`, `madvise`, `getauxval`, `sigaction`, `__register_atfork`.
+- Конфиг — файл `lyb.prop` рядом с модулем: `fgappver=7`, `vulkan=2`
+  (профиль приложения + режим Vulkan).
 
-Модуль содержит стандартные Zygisk entrypoints:
+## Вывод о механизме хука
 
-- `zygisk_module_entry`
-- `zygisk_companion_entry`
+`fg hook` = **frame generation**: модуль перехватывает функцию предъявления кадра
+(present) графического API и между двумя «настоящими» кадрами вставляет
+сгенерированный промежуточный кадр, повышая воспринимаемый FPS.
 
-Зависимости ARM64:
+Два пути предъявления кадра, которые надо хукать:
 
-- `liblog.so`
-- `libGLESv3.so`
-- `libGLESv2.so`
-- `libEGL.so`
-- `libm.so`
-- `libdl.so`
-- `libc.so`
+- **OpenGL ES / EGL:** `eglSwapBuffers` (и `eglSwapInterval`).
+- **Vulkan:** `vkQueuePresentKHR` (включается при `vulkan=...` в конфиге).
 
-В бинарнике статически видны OpenSSL/cpp-httplib/сетевые символы: `socket`, `connect`, `sendto`, `recvfrom`, `getaddrinfo`, HTTP/HTTPS строки, proxy env strings. Явных доменов аналитики при простом `strings` почти нет; скорее всего сетевой код либо общий bundled TLS/HTTP стек, либо адреса/пути собраны/зашифрованы/получаются динамически.
+Механизм инлайн-хука (как в оригинале):
 
-Лицензия упоминает `Zygisk-UnityHook` от Rikka, поэтому начинать чистую реализацию логично с минимального Zygisk + Unity/GL hook, без embedded HTTP/TLS.
+1. Zygisk инжектит `liblybfghook.so` в процесс целевой игры через
+   `postAppSpecialize`.
+2. Модуль ждёт/находит загруженные `libEGL.so` / `libvulkan.so` (через
+   `dl_iterate_phdr` или `dlopen`+`dlsym`).
+3. Разрешает адрес present-функции и ставит **inline hook** (trampoline): меняет
+   защиту страницы `mprotect`, переписывает пролог на переход в свой обработчик,
+   сохраняет оригинальные инструкции в trampoline, чистит I-cache.
+4. В обработчике делает frame pacing + генерацию промежуточного кадра, затем
+   вызывает оригинал.
 
-## Рекомендуемый clean-room план
+## Чем этот проект отличается
 
-1. Не переносить код из `.so` напрямую, только поведение/архитектурные идеи.
-2. Стартовать от официального Zygisk API / минимального шаблона.
-3. Оставить только:
-   - фильтр целевого process/package;
-   - `preAppSpecialize` / `postAppSpecialize`;
-   - `dlopen`/`dlsym` detection нужной Unity/GL библиотеки;
-   - локальный hook нужных функций;
-   - логирование через `__android_log_print` под debug flag.
-4. Убрать полностью:
-   - OpenSSL/curl/cpp-httplib;
-   - socket/connect/send/recv;
-   - любые remote config, license check, telemetry, analytics;
-   - фоновые сетевые threads.
+- **Ноль сети.** Нет OpenSSL/curl/cpp-httplib, нет `socket/connect/send/recv`,
+  нет лицензий и телеметрии.
+- Инлайн-хукер — внешняя проверенная библиотека (ShadowHook или Dobby), а не
+  переписанный из бинарника движок.
+- Конфиг — локальный `cleanfg.prop`, читается с диска, наружу ничего не уходит.
 
-## Ghidra
+## Структура
 
-Установите Ghidra локально и запустите:
-
-```bash
-GHIDRA_INSTALL_DIR=/path/to/ghidra ./scripts/ghidra_headless.sh
+```
+cleanfg/
+├── README.md
+├── ARCHITECTURE.md        # подробный разбор механизма и плана реализации
+├── module/
+│   ├── module.prop
+│   ├── customize.sh
+│   └── cleanfg.prop       # локальный конфиг (аналог lyb.prop)
+└── jni/
+    ├── CMakeLists.txt
+    ├── zygisk.hpp         # официальный Zygisk C++ API header (заглушка-ссылка)
+    ├── main.cpp           # Zygisk entrypoint + companion
+    ├── hook_egl.cpp       # хук eglSwapBuffers (GLES путь)
+    ├── hook_vulkan.cpp    # хук vkQueuePresentKHR (Vulkan путь)
+    ├── frame_gen.cpp      # логика frame pacing / генерации кадра (TODO-ядро)
+    ├── frame_gen.h
+    ├── config.cpp         # парсер cleanfg.prop
+    ├── config.h
+    └── log.h
 ```
 
-После импорта ищите:
+## Что ещё нужно для 1:1 функционала
 
-- exports: `zygisk_module_entry`, `zygisk_companion_entry`;
-- references to `dlopen`, `dlsym`, `pthread_create`;
-- calls to `connect`, `sendto`, `recvfrom`, `getaddrinfo`;
-- references to `libGLESv2.so`, `libGLESv3.so`, `libEGL.so`;
-- init arrays / constructors.
+Точная **математика генерации кадра** (warp/interpolation/extrapolation, работа с
+motion vectors, depth, reprojection) — единственное, что нельзя достать из stripped
+бинарника через `strings`/`readelf`. Её надо получить из декомпиляции через твой
+GitHub-workflow: после фикса `ghidra_out` смотри `*.decompiled.c`, функции рядом с
+perpresent-хуком и `glReadPixels`/`glBlitFramebuffer`/текстурными операциями. Перенос —
+только на уровне алгоритма (clean-room), не байт-в-байт.
+
+## Сборка
+
+```bash
+cd jni
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
+cmake --build build
+```
+
+Далее упаковать `module/` + собранную `.so` в zip и прошить через Magisk/KernelSU
+(Zygisk включён).
 
 
-## GitHub Actions workflow
+---
 
-В репозитории добавлен workflow `.github/workflows/analyze.yml`.
+## ⚙️ Автоматическая сборка (GitHub Actions)
 
-Он запускается при каждом `push`, `pull_request` и вручную через `workflow_dispatch`.
+Этот архив — полный исходник. Сам модуль (`.so`) компилируется автоматически в GitHub Actions — локально NDK ставить не нужно.
 
-Что делает workflow:
+### Как получить готовый `cleanfg-magisk.zip`
 
-1. Устанавливает базовые ELF-инструменты.
-2. Запускает `scripts/basic_static.sh`.
-3. Скачивает Ghidra.
-4. Запускает headless Ghidra через `scripts/ghidra_full_analysis.sh`.
-5. Экспортирует результаты в:
-   - `analysis_out/`
-   - `ghidra_out/`
-6. Загружает ZIP с результатами как GitHub Actions artifact.
+1. Создайте новый репозиторий на GitHub (Public или Private — любой).
+2. Загрузите туда всё содержимое этого архива (вместе с папкой `.github/`).
+   - Через сайт: Add file → Upload files, либо `git push`.
+3. Откройте вкладку **Actions** — сборка «Build cleanfg Magisk module» запустится сама. Если нет — нажмите **Run workflow**.
+4. По окончании (~5–10 мин) откройте запуск → раздел **Artifacts** → скачайте **cleanfg-magisk**.
+   - Внутри будет `cleanfg-magisk.zip` — это и есть файл для прошивки в Magisk/KernelSU.
+5. (Необязательно) Создайте git-тег (`git tag v0.1.0 && git push --tags`) — тогда zip автоматически прикрепится к GitHub Release.
 
-Важно: Ghidra ZIP URL в workflow привязан к конкретной версии. Если GitHub/NSA изменит имя релиза, поменяйте `GHIDRA_VERSION` и URL в `.github/workflows/analyze.yml`.
+### Что делает workflow
+
+- Ставит Android NDK r26 + CMake + Ninja.
+- Скачивает официальный `zygisk.hpp` (с проверкой) — заменяет встроенную заглушку.
+- Компилирует `.so` под `arm64-v8a` и `armeabi-v7a`, влинковывая Dobby статически (один самодостаточный файл).
+- Кладёт их в `module/zygisk/<abi>.so` и упаковывает весь `module/` в `cleanfg-magisk.zip`.
+
+### На какие приложения действует
+
+По умолчанию модуль АКТИВЕН ТОЛЬКО для пакетов из `target_packages` в `cleanfg.prop` (по умолчанию `com.example.game`). Чтобы включить для всех игр/приложений — поставьте `target_packages=*`. После установки конфиг лежит в `/data/adb/modules/cleanfg/cleanfg.prop`.
+
+> Честное предупреждение: янтерполяция кадров через перехват EGL/Vulkan — экспериментальная техника. Работает не во всех играх и не на всех GPU; начните с одного тестового приложения и смотрите `logcat -s cleanfg`.
