@@ -122,6 +122,104 @@ const char* LIB_CANDIDATES[] = {
 const char* NS_CANDIDATES[] = { "sphal", "vndk", "vndk_product", "default", "system" };
 typedef struct android_namespace_t* (*FnGetNs)(const char*);
 
+// ---- custom linker namespace (cross-partition load) ----------------------
+// The engine lib lives in /system/lib64 but DT_NEEDED-depends on a /vendor HAL
+// lib (vendor.qti.hardware.vpp-V1-ndk.so). No stock namespace can see BOTH
+// partitions: 'default'/'system' can open the /system lib but are forbidden
+// from resolving the vendor dependency, while 'sphal' can resolve vendor libs
+// but refuses the /system path. Solution: build our own SHARED, non-isolated
+// namespace whose search path spans both partitions, and link it to the
+// platform namespaces so transitive VNDK-SP / SP-HAL deps resolve with their
+// proper allowlists.
+constexpr uint64_t NS_TYPE_REGULAR  = 0;
+constexpr uint64_t NS_TYPE_ISOLATED = 1;
+constexpr uint64_t NS_TYPE_SHARED   = 2;
+typedef struct android_namespace_t* (*FnCreateNs)(
+    const char* name, const char* ld_library_path,
+    const char* default_library_path, uint64_t type,
+    const char* permitted_when_isolated_path, struct android_namespace_t* parent);
+typedef bool (*FnLinkNs)(struct android_namespace_t* from,
+                         struct android_namespace_t* to,
+                         const char* shared_libs_sonames);
+
+// Search path covering every partition the engine + its deps may live in.
+const char* GPP_NS_PATHS =
+    "/system/lib64:/system_ext/lib64:/vendor/lib64:/vendor/lib64/hw:"
+    "/odm/lib64:/odm/lib64/hw:/vendor/lib64/egl:/data/adb/modules/gamespace/system/lib64";
+// Vendor/HAL sonames our custom ns is allowed to pull from the sphal namespace.
+const char* GPP_SPHAL_ALLOW =
+    "vendor.qti.hardware.vpp-V1-ndk.so:vendor.qti.hardware.vpp-V1-ndk_platform.so:"
+    "vendor.qti.hardware.vpp-V1.0-ndk.so:libvppclient.so:libvpphcp.so:libvpp.so:"
+    "libqdMetaData.so:libgralloctypes.so:android.hardware.graphics.mapper@4.0.so";
+// Core/VNDK sonames shared down from the default & vndk namespaces.
+const char* GPP_CORE_ALLOW =
+    "libc.so:libdl.so:libm.so:liblog.so:libc++.so:libstdc++.so:libz.so:"
+    "libutils.so:libcutils.so:libbase.so:libbinder.so:libbinder_ndk.so:"
+    "libui.so:libgui.so:libnativewindow.so:libsync.so:libhardware.so:"
+    "libhidlbase.so:libvndksupport.so";
+
+// Build (once) a permissive namespace that can see system + vendor at once.
+struct android_namespace_t* createGppNamespace(bool first) {
+    static struct android_namespace_t* cached = nullptr;
+    static bool tried = false;
+    if (tried) return cached;
+    tried = true;
+
+    FnCreateNs createNs = (FnCreateNs)dlsym(RTLD_DEFAULT, "android_create_namespace");
+    FnLinkNs   linkNs   = (FnLinkNs)dlsym(RTLD_DEFAULT, "android_link_namespaces");
+    FnGetNs    getNs    = (FnGetNs)dlsym(RTLD_DEFAULT, "android_get_exported_namespace");
+    if (!createNs) { if (first) LOGW("gpp: android_create_namespace unavailable"); return nullptr; }
+
+    // SHARED so already-loaded core libs (libc/libdl/...) from the app namespace
+    // are reused instead of double-loaded. parent=nullptr -> caller's namespace.
+    cached = createNs("cleanfg_gpp", GPP_NS_PATHS, GPP_NS_PATHS,
+                      NS_TYPE_SHARED, nullptr, nullptr);
+    if (!cached) { if (first) LOGW("gpp: android_create_namespace failed"); return nullptr; }
+
+    if (linkNs) {
+        struct android_namespace_t* sphal = getNs ? getNs("sphal") : nullptr;
+        struct android_namespace_t* def   = getNs ? getNs("default") : nullptr;
+        struct android_namespace_t* vndk  = getNs ? getNs("vndk") : nullptr;
+        if (sphal && !linkNs(cached, sphal, GPP_SPHAL_ALLOW) && first)
+            LOGW("gpp: link cleanfg_gpp->sphal failed");
+        if (def)  linkNs(cached, def,  GPP_CORE_ALLOW);
+        if (vndk) linkNs(cached, vndk, GPP_CORE_ALLOW);
+    }
+    LOGI("gpp: custom namespace 'cleanfg_gpp' created (%p)", (void*)cached);
+    return cached;
+}
+
+// Try to load the engine lib through the custom cross-partition namespace.
+void* loadEngineViaCustomNs(bool first) {
+    struct android_namespace_t* ns = createGppNamespace(first);
+    if (!ns) return nullptr;
+    android_dlextinfo info; memset(&info, 0, sizeof(info));
+    info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+    info.library_namespace = ns;
+
+    // Pre-load the vendor dependency first for a precise failure point. Once it
+    // is resolved inside this namespace, the engine's DT_NEEDED is satisfied by
+    // soname without re-searching the (forbidden-for-vendor) /system paths.
+    const char* deps[] = {
+        "vendor.qti.hardware.vpp-V1-ndk.so",
+        "vendor.qti.hardware.vpp-V1-ndk_platform.so",
+        "vendor.qti.hardware.vpp-V1.0-ndk.so",
+    };
+    for (const char* d : deps) {
+        void* dep = android_dlopen_ext(d, RTLD_NOW | RTLD_GLOBAL, &info);
+        if (dep) { LOGI("gpp: preloaded vendor dep %s", d); break; }
+        if (first) { const char* e = dlerror(); LOGW("gpp: dep '%s': %.120s", d, e ? e : "?"); }
+    }
+
+    for (const char* c : LIB_CANDIDATES) {
+        if (c[0] != '/') continue;  // namespace load needs an absolute path
+        void* h = android_dlopen_ext(c, RTLD_NOW | RTLD_GLOBAL, &info);
+        if (h) { LOGI("gpp: dlopen_ext ok via custom ns: %s", c); return h; }
+        if (first) { const char* e = dlerror(); LOGW("gpp: custom ns '%s': %.120s", c, e ? e : "?"); }
+    }
+    return nullptr;
+}
+
 // Find RefBase subobject inside a virtually-derived object (Phase 15 logic).
 void* findRefBase(void* obj) {
     for (int O = 0; O <= 512; O += 8) {
@@ -207,7 +305,14 @@ bool GppEngine::init() {
     ++attempts;
     const bool first = (attempts == 1);
 
+    // 0) PRIMARY: custom cross-partition namespace. The engine lib is in
+    //    /system/lib64 but needs a /vendor HAL lib; only a namespace that can
+    //    see both partitions at once can satisfy that DT_NEEDED.
+    g_lib = loadEngineViaCustomNs(first);
+    if (g_lib) { lib_ = g_lib; }
+
     // 1) plain dlopen in the app default namespace
+    if (!g_lib)
     for (const char* c : LIB_CANDIDATES) {
         g_lib = dlopen(c, RTLD_NOW | RTLD_GLOBAL);
         if (g_lib) { LOGI("gpp: dlopen ok: %s", c); break; }

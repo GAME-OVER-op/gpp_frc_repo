@@ -37,3 +37,29 @@ debug=0
 ```
 
 `max_fps=0` значит: просить `measured_fps * multiplier`, а Android сам зажмёт до доступного режима панели. Если хочешь жёстко ограничить — поставь `max_fps=120` или `144`.
+
+## Загрузка движка GPP через собственный linker-namespace (фикс)
+
+Лог показал: Vulkan-захват работает (`vk: capture ready ...`), но движок
+`libgppvppgfrcplussession.so` не грузился:
+
+```
+dlopen failed: library "vendor.qti.hardware.vpp-V1-ndk.so" not found:
+  needed by /system/lib64/libgppvppgfrcplussession.so
+```
+
+Причина — изоляция linker-namespace (Treble):
+
+- движок лежит в `/system/lib64` → его видят только namespace `default`/`system`,
+  но им ЗАПРЕЩЕНО резолвить вендорную зависимость `vendor.qti.hardware.vpp-V1-ndk.so`;
+- namespace `sphal` умеет грузить вендорные либы, но ОТКАЗЫВАЕТСЯ открывать путь
+  `/system/lib64` (`...is not accessible for the namespace`).
+
+Ни один штатный namespace не видит обе партиции сразу. Решение в `gpp_engine.cpp`:
+создаём СВОЙ namespace `cleanfg_gpp` через `android_create_namespace`
+(тип SHARED, не isolated) с путём поиска по `/system/lib64` + `/vendor/lib64` +
+`/odm/lib64`, и линкуем его к `sphal`/`vndk`/`default`
+(`android_link_namespaces`) с нужными allowlist'ами sonames. Затем грузим движок
+через `android_dlopen_ext` уже в этом namespace — DT_NEEDED на вендорную либу
+резолвится. Старые способы (plain dlopen, exported namespaces) оставлены как
+fallback.
