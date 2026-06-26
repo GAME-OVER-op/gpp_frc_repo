@@ -32,8 +32,8 @@ patch_dobby() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     echo "Patching Mach-O relocations in: $f"
-    sed -i -E 's/([A-Za-z_.$][A-Za-z0-9_.$]*)@PAGEOFF/:lo12:\1/g' "$f"
-    sed -i -E 's/([A-Za-z_.$][A-Za-z0-9_.$]*)@PAGE/\1/g' "$f"
+    sed -i -E 's/([^[:space:],]+)@PAGEOFF/:lo12:\1/g' "$f"
+    sed -i 's/@PAGE//g' "$f"
   done < <(grep -rlE '@PAGEOFF|@PAGE' "$src" || true)
 }
 

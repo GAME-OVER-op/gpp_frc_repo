@@ -62,12 +62,15 @@ jobs:
               -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI="$ABI" \
               -DANDROID_PLATFORM=android-26 \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+              -DCMAKE_BUILD_TYPE=Release
 
             # 2) Patch Dobby: its arm64 closure-bridge assembly uses Apple
             #    Mach-O relocation syntax (@PAGE / @PAGEOFF) that the NDK r26
-            #    ELF assembler rejects. Rewrite to ELF form. Safe no-op on arm.
+            #    ELF assembler rejects. Rewrite to ELF form:
+            #      adrp x, sym@PAGE        -> adrp x, sym
+            #      add  x, x, sym@PAGEOFF  -> add  x, x, :lo12:sym
+            #    The operand may be wrapped in a cdecl(...) macro, so we match
+            #    any non-space, non-comma token. Safe no-op on arm.
             #    See Dobby issues #253 / #277.
             DOBBY_SRC="$BUILD_DIR/_deps/dobby-src"
             if [ -d "$DOBBY_SRC" ]; then
@@ -76,8 +79,8 @@ jobs:
                 [ -n "$f" ] || continue
                 echo "Patching Mach-O relocations in: $f"
                 # @PAGEOFF first (it contains the substring @PAGE).
-                sed -i -E 's/([A-Za-z_.\$][A-Za-z0-9_.\$]*)@PAGEOFF/:lo12:\1/g' "$f"
-                sed -i -E 's/([A-Za-z_.\$][A-Za-z0-9_.\$]*)@PAGE/\1/g' "$f"
+                sed -i -E 's/([^[:space:],]+)@PAGEOFF/:lo12:\1/g' "$f"
+                sed -i 's/@PAGE//g' "$f"
               done
               if grep -rqE '@PAGEOFF|@PAGE' "$DOBBY_SRC"; then
                 echo "::error::Mach-O relocation syntax still present after patch"
