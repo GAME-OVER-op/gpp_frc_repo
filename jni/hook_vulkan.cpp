@@ -51,6 +51,20 @@ struct DevFns {
     PFN_vkMapMemory             mapMem = nullptr;
     PFN_vkAcquireNextImageKHR   acquireNextImage = nullptr;
     PFN_vkCmdCopyImage          cmdCopyImage = nullptr;
+    PFN_vkCreateImage                 createImage = nullptr;
+    PFN_vkGetImageMemoryRequirements  getImgReq = nullptr;
+    PFN_vkBindImageMemory             bindImgMem = nullptr;
+    PFN_vkCreateImageView             createImageView = nullptr;
+    PFN_vkCreateDescriptorSetLayout   createDescSetLayout = nullptr;
+    PFN_vkCreateDescriptorPool        createDescPool = nullptr;
+    PFN_vkAllocateDescriptorSets      allocDescSets = nullptr;
+    PFN_vkUpdateDescriptorSets        updateDescSets = nullptr;
+    PFN_vkCreatePipelineLayout        createPipeLayout = nullptr;
+    PFN_vkCreateShaderModule          createShaderModule = nullptr;
+    PFN_vkCreateComputePipelines      createComputePipelines = nullptr;
+    PFN_vkCmdBindPipeline             cmdBindPipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets       cmdBindDescSets = nullptr;
+    PFN_vkCmdDispatch                 cmdDispatch = nullptr;
     VkPhysicalDevice            phys = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps{};
     bool ok = false;
@@ -91,6 +105,18 @@ struct SwapInfo {
     int blendRowBytes = 0;
     VkDeviceSize blendBytes = 0;
     bool blendReady = false;
+    // --- Stage 2B: GPU compute-blend resources ---
+    VkImage gPrev = VK_NULL_HANDLE, gCur = VK_NULL_HANDLE, gOut = VK_NULL_HANDLE;
+    VkDeviceMemory gPrevMem = VK_NULL_HANDLE, gCurMem = VK_NULL_HANDLE, gOutMem = VK_NULL_HANDLE;
+    VkImageView gPrevView = VK_NULL_HANDLE, gCurView = VK_NULL_HANDLE, gOutView = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool gDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet gDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout gPipeLayout = VK_NULL_HANDLE;
+    VkPipeline gPipe = VK_NULL_HANDLE;
+    VkShaderModule gShader = VK_NULL_HANDLE;
+    bool gHasPrev = false;
+    bool gpuReady = false;
 };
 
 std::mutex g_mtx;
@@ -133,6 +159,20 @@ DevFns& devFns(VkDevice dev) {
     f.mapMem        = (PFN_vkMapMemory)G("vkMapMemory");
     f.acquireNextImage = (PFN_vkAcquireNextImageKHR)G("vkAcquireNextImageKHR");
     f.cmdCopyImage  = (PFN_vkCmdCopyImage)G("vkCmdCopyImage");
+    f.createImage            = (PFN_vkCreateImage)G("vkCreateImage");
+    f.getImgReq              = (PFN_vkGetImageMemoryRequirements)G("vkGetImageMemoryRequirements");
+    f.bindImgMem             = (PFN_vkBindImageMemory)G("vkBindImageMemory");
+    f.createImageView        = (PFN_vkCreateImageView)G("vkCreateImageView");
+    f.createDescSetLayout    = (PFN_vkCreateDescriptorSetLayout)G("vkCreateDescriptorSetLayout");
+    f.createDescPool         = (PFN_vkCreateDescriptorPool)G("vkCreateDescriptorPool");
+    f.allocDescSets          = (PFN_vkAllocateDescriptorSets)G("vkAllocateDescriptorSets");
+    f.updateDescSets         = (PFN_vkUpdateDescriptorSets)G("vkUpdateDescriptorSets");
+    f.createPipeLayout       = (PFN_vkCreatePipelineLayout)G("vkCreatePipelineLayout");
+    f.createShaderModule     = (PFN_vkCreateShaderModule)G("vkCreateShaderModule");
+    f.createComputePipelines = (PFN_vkCreateComputePipelines)G("vkCreateComputePipelines");
+    f.cmdBindPipeline        = (PFN_vkCmdBindPipeline)G("vkCmdBindPipeline");
+    f.cmdBindDescSets        = (PFN_vkCmdBindDescriptorSets)G("vkCmdBindDescriptorSets");
+    f.cmdDispatch            = (PFN_vkCmdDispatch)G("vkCmdDispatch");
     auto pit = g_devPhys.find(dev);
     if (pit != g_devPhys.end()) {
         f.phys = pit->second;
