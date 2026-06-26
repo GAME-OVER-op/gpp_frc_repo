@@ -1,6 +1,6 @@
 id=cleanfg
 name=cleanfg
-version=v0.6.0-present
-versionCode=6
+version=v0.7.0-pbridge
+versionCode=7
 author=clean-room
-description=Clean Zygisk FRC hook (GPPSession vendor-engine client; SELinux relax + 120Hz elevation; no network)
+description=Clean Zygisk FRC hook (present-bridge frame injection stage 1; no network)

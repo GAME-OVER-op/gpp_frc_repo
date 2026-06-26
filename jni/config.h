@@ -15,6 +15,7 @@ struct Config {
     int max_fps = 0;              // 0 = auto / OS clamps to panel
     bool elevate_rate = true;     // request 120/144/etc via ANativeWindow_setFrameRate
     bool force_swap_interval_0 = true;
+    bool present_bridge = false;  // Stage 1: inject duplicate presents (frame-gen bridge)
     bool debug = false;
     bool matchesPackage(const char* name) const;
 };

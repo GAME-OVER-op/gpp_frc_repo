@@ -4,5 +4,6 @@ multiplier=2
 max_fps=0
 elevate_rate=1
 force_swap_interval_0=1
+present_bridge=1
 method=blend
 debug=1

@@ -70,15 +70,17 @@ static void parseConfigText(const std::string& content) {
             g_config.elevate_rate = (val == "1" || val == "true");
         } else if (key == "force_swap_interval_0") {
             g_config.force_swap_interval_0 = (val == "1" || val == "true");
+        } else if (key == "present_bridge") {
+            g_config.present_bridge = (val == "1" || val == "true");
         } else if (key == "debug") {
             g_config.debug = (val == "1" || val == "true");
         }
     }
 
-    LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d debug=%d",
+    LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
          g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
-         g_config.force_swap_interval_0, g_config.debug);
+         g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);
 }
 
 // Read an entire fd to EOF and parse it. Works for both a regular file fd
