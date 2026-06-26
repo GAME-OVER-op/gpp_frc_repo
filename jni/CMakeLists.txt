@@ -23,11 +23,20 @@ if(USE_SHADOWHOOK)
     set(HOOK_INCLUDE ${shadowhook_SOURCE_DIR}/shadowhook/src/main/cpp/include)
 else()
     # Build Dobby as a static library so it links directly into our module.
+    #
+    # NOTE: we use the BepInEx/Dobby fork instead of upstream jmpews/Dobby.
+    # Upstream master is frequently broken (mid-refactor: missing core/arch/Cpu.h,
+    # undeclared OSMemory, RuntimeModule.load_address, etc.). The BepInEx fork is
+    # curated for stable cross-platform builds (Android/Linux/Windows/macOS) and
+    # builds cleanly with modern NDK. Pinned to a branch that does not move under us.
     set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
     set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
+    set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+    set(DOBBY_BUILD_TEST OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(dobby
-        GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-        GIT_TAG master)
+        GIT_REPOSITORY https://github.com/BepInEx/Dobby.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(dobby)
     set(HOOK_LIB dobby)
     set(HOOK_INCLUDE ${dobby_SOURCE_DIR}/include)
