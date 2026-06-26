@@ -2,10 +2,13 @@
 #include "config.h"
 #include "log.h"
 #include <android/native_window.h>
+#include <dlfcn.h>
 #include <mutex>
 #include <unordered_map>
 #include <cmath>
 
+// Frame-rate hint constants. Defined locally so we do not depend on API-30+ enums
+// when building against android-26.
 #ifndef ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
 #define ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE 1
 #endif
@@ -13,9 +16,30 @@
 #define ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS 1
 #endif
 
-extern "C" int ANativeWindow_setFrameRate(ANativeWindow* window, float frameRate, int8_t compatibility, int8_t changeFrameRateStrategy) __attribute__((weak));
-
 namespace cleanfg {
+
+// ANativeWindow_setFrameRate is __INTRODUCED_IN(30); the "with change strategy"
+// variant is __INTRODUCED_IN(31). We build against android-26 and must also run on
+// older devices, so we resolve these at runtime via dlsym instead of referencing the
+// guarded symbols directly (which is both a compile error under API 26 and breaks the
+// weak-symbol null check).
+using PFN_setFrameRate = int32_t (*)(ANativeWindow*, float, int8_t);
+using PFN_setFrameRateWithStrategy = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+static PFN_setFrameRate g_setFrameRate = nullptr;
+static PFN_setFrameRateWithStrategy g_setFrameRateWithStrategy = nullptr;
+static std::once_flag g_resolveOnce;
+
+static void resolveFrameRateApis() {
+    void* lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) lib = dlopen("libandroid.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) { LOGW("display_rate: dlopen libnativewindow/libandroid failed: %s", dlerror()); return; }
+    g_setFrameRateWithStrategy =
+        (PFN_setFrameRateWithStrategy)dlsym(lib, "ANativeWindow_setFrameRateWithChangeStrategy");
+    g_setFrameRate = (PFN_setFrameRate)dlsym(lib, "ANativeWindow_setFrameRate");
+    LOGI("display_rate: setFrameRate=%p withStrategy=%p",
+         (void*)g_setFrameRate, (void*)g_setFrameRateWithStrategy);
+}
+
 static std::mutex g_mu;
 static std::unordered_map<EGLSurface, ANativeWindow*> g_windows;
 static float g_lastRequested = 0.0f;
@@ -47,7 +71,8 @@ float chooseTargetRate(float measuredGameFps) {
 
 void requestBestFrameRate(EGLSurface surface, float measuredGameFps) {
     if (!g_config.elevate_rate) return;
-    if (!ANativeWindow_setFrameRate) return;
+    std::call_once(g_resolveOnce, resolveFrameRateApis);
+    if (!g_setFrameRate && !g_setFrameRateWithStrategy) return;
     ANativeWindow* w = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mu);
@@ -58,9 +83,15 @@ void requestBestFrameRate(EGLSurface surface, float measuredGameFps) {
     float target = chooseTargetRate(measuredGameFps);
     if (target < 30.0f) return;
     if (std::fabs(target - g_lastRequested) < 1.0f) return;
-    int r = ANativeWindow_setFrameRate(w, target,
-        ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
-        ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS);
+    int r = 0;
+    if (g_setFrameRateWithStrategy) {
+        r = g_setFrameRateWithStrategy(w, target,
+            ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+            ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS);
+    } else {
+        r = g_setFrameRate(w, target,
+            ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+    }
     g_lastRequested = target;
     LOGI("requested display frameRate %.1f for measured game %.1f, result=%d", target, measuredGameFps, r);
 }
