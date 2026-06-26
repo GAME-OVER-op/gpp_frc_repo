@@ -1,0 +1,17 @@
+#version 450
+// cleanfg GPU frame-blend: out = (prev + cur) * 0.5
+// All three are storage images in VK_FORMAT_R8G8B8A8_UNORM (rgba8). The 50/50
+// average is channel-order agnostic, so this is correct for RGBA or BGRA
+// swapchains alike (we copy raw bytes in/out).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly  image2D prevImg;
+layout(set = 0, binding = 1, rgba8) uniform readonly  image2D curImg;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D outImg;
+void main() {
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(curImg);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec4 a = imageLoad(prevImg, p);
+    vec4 b = imageLoad(curImg, p);
+    imageStore(outImg, p, (a + b) * 0.5);
+}

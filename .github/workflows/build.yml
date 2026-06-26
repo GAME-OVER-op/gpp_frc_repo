@@ -49,6 +49,14 @@ jobs:
           fi
           head -5 jni/zygisk.hpp
 
+      - name: Compile blend compute shader to SPIR-V header
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          glslangValidator -V jni/blend.comp --vn blend_comp_spv -o jni/blend_comp.h
+          head -8 jni/blend_comp.h
+
       - name: Build native module for each ABI
         run: |
           set -eux

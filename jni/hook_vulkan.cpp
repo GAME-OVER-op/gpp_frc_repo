@@ -16,6 +16,7 @@
 #include <vector>
 #include <mutex>
 #include <cstring>
+#include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
 
 namespace cleanfg {
 
@@ -315,16 +316,107 @@ bool ensureBlend(SwapInfo& sw, DevFns& f) {
 // current frame (CPU 50/50 blend) and present it BEFORE the real current
 // frame. Returns true if the app's wait semaphores were consumed by our
 // download submit (the caller must then present the real frame WITHOUT them).
+bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
+    if (sw.gpuReady) return true;
+    if (!f.createImage || !f.getImgReq || !f.bindImgMem || !f.createImageView ||
+        !f.createDescSetLayout || !f.createDescPool || !f.allocDescSets || !f.updateDescSets ||
+        !f.createPipeLayout || !f.createShaderModule || !f.createComputePipelines ||
+        !f.cmdBindPipeline || !f.cmdBindDescSets || !f.cmdDispatch) {
+        LOGE("vk: gpu-blend missing device fns"); return false;
+    }
+    const VkFormat fmt = sw.format;  // matches swapchain (R8G8B8A8_UNORM = 37 on this device)
+    auto mkImg = [&](VkImage* img, VkDeviceMemory* mem, VkImageView* view) -> bool {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = {sw.extent.width, sw.extent.height, 1};
+        ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (f.createImage(sw.device, &ici, nullptr, img) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr{}; f.getImgReq(sw.device, *img, &mr);
+        int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
+        if (f.allocMem(sw.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
+        if (f.bindImgMem(sw.device, *img, *mem, 0) != VK_SUCCESS) return false;
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = *img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        return f.createImageView(sw.device, &vci, nullptr, view) == VK_SUCCESS;
+    };
+    if (!mkImg(&sw.gPrev, &sw.gPrevMem, &sw.gPrevView)) { LOGE("vk: gpu-blend prev img fail"); return false; }
+    if (!mkImg(&sw.gCur,  &sw.gCurMem,  &sw.gCurView))  { LOGE("vk: gpu-blend cur img fail");  return false; }
+    if (!mkImg(&sw.gOut,  &sw.gOutMem,  &sw.gOutView))  { LOGE("vk: gpu-blend out img fail");  return false; }
+
+    VkDescriptorSetLayoutBinding binds[3]{};
+    for (int i = 0; i < 3; ++i) {
+        binds[i].binding = (uint32_t)i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dlci.bindingCount = 3; dlci.pBindings = binds;
+    if (f.createDescSetLayout(sw.device, &dlci, nullptr, &sw.gDescLayout) != VK_SUCCESS) { LOGE("vk: gpu-blend desc layout fail"); return false; }
+
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz;
+    if (f.createDescPool(sw.device, &dpci, nullptr, &sw.gDescPool) != VK_SUCCESS) { LOGE("vk: gpu-blend desc pool fail"); return false; }
+
+    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = sw.gDescPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &sw.gDescLayout;
+    if (f.allocDescSets(sw.device, &dsai, &sw.gDescSet) != VK_SUCCESS) { LOGE("vk: gpu-blend desc set fail"); return false; }
+
+    VkDescriptorImageInfo dii[3]{};
+    dii[0].imageView = sw.gPrevView; dii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dii[1].imageView = sw.gCurView;  dii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dii[2].imageView = sw.gOutView;  dii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet wds[3]{};
+    for (int i = 0; i < 3; ++i) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = sw.gDescSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wds[i].pImageInfo = &dii[i];
+    }
+    f.updateDescSets(sw.device, 3, wds, 0, nullptr);
+
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = sizeof(blend_comp_spv); smci.pCode = blend_comp_spv;
+    if (f.createShaderModule(sw.device, &smci, nullptr, &sw.gShader) != VK_SUCCESS) { LOGE("vk: gpu-blend shader module fail"); return false; }
+
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1; plci.pSetLayouts = &sw.gDescLayout;
+    if (f.createPipeLayout(sw.device, &plci, nullptr, &sw.gPipeLayout) != VK_SUCCESS) { LOGE("vk: gpu-blend pipe layout fail"); return false; }
+
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = sw.gShader;
+    cpci.stage.pName = "main";
+    cpci.layout = sw.gPipeLayout;
+    if (f.createComputePipelines(sw.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &sw.gPipe) != VK_SUCCESS) { LOGE("vk: gpu-blend pipeline fail"); return false; }
+
+    sw.gHasPrev = false;
+    sw.gpuReady = true;
+    LOGI("vk: gpu-blend ready %ux%u fmt=%d", sw.extent.width, sw.extent.height, (int)sw.format);
+    return true;
+}
+
 bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR* info, uint32_t srcIndex) {
     std::lock_guard<std::mutex> lk(g_mtx);
     auto sit = g_swaps.find(swapchain);
     if (sit == g_swaps.end()) return false;
     SwapInfo& sw = sit->second;
     DevFns& f = devFns(sw.device);
-    if (!f.ok || !f.acquireNextImage || !f.copyImgToBuf || !f.copyBufToImg) return false;
+    if (!f.ok || !f.acquireNextImage || !f.cmdCopyImage || !f.cmdDispatch) return false;
     if (srcIndex >= sw.images.size()) return false;
     if (!ensureInject(sw, f)) return false;
-    if (!ensureBlend(sw, f)) return false;
+    if (!ensureGpuBlend(sw, f)) return false;
 
     // Acquire the destination image BEFORE consuming app semaphores, so a
     // timeout here falls back cleanly to a normal single present.
@@ -343,26 +435,99 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkBufferImageCopy reg{};
-    reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    reg.imageExtent = {sw.extent.width, sw.extent.height, 1};
 
-    // ---- Submit #1: download current frame (src) into dlBuf. Waits on (and
-    // consumes) the app's render semaphores so src is fully drawn. ----
+    auto imgBar = [&](VkImage img, VkImageLayout o, VkImageLayout n,
+                      VkAccessFlags sa, VkAccessFlags da,
+                      VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img; b.oldLayout = o; b.newLayout = n;
+        b.srcAccessMask = sa; b.dstAccessMask = da;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        f.barrier(sw.injCmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    VkImageCopy cp{};
+    cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {sw.extent.width, sw.extent.height, 1};
+
     f.resetCmd(sw.injCmd, 0);
     f.beginCmd(sw.injCmd, &bi);
-    b.image = src;
-    b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;   b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    f.copyImgToBuf(sw.injCmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sw.dlBuf, 1, &reg);
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+    // (1) Copy the freshly-rendered swapchain image (src) into our gCur image.
+    imgBar(src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+           VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imgBar(sw.gCur, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+           0, VK_ACCESS_TRANSFER_WRITE_BIT,
+           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    f.cmdCopyImage(sw.injCmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    imgBar(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+           VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    if (!sw.gHasPrev) {
+        // First frame: no history yet. Seed gPrev = cur and present a duplicate.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        sw.gHasPrev = true;
+    } else {
+        // gCur -> GENERAL (compute reads), gOut -> GENERAL (compute writes). gPrev already GENERAL.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
+        f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
+        uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
+        f.cmdDispatch(sw.injCmd, gx, gy, 1);
+        // gOut -> TRANSFER_SRC, dst -> TRANSFER_DST, copy interpolated midpoint into dst.
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // History update: gCur -> gPrev (both currently GENERAL), leave gPrev GENERAL.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
     f.endCmd(sw.injCmd);
 
     std::vector<VkPipelineStageFlags> waitStages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -372,42 +537,9 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     si.pWaitDstStageMask = info->waitSemaphoreCount ? waitStages.data() : nullptr;
     si.commandBufferCount = 1; si.pCommandBuffers = &sw.injCmd;
     f.resetFences(sw.device, 1, &sw.injFence);
-    if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: blend download submit fail"); return false; }
-    // App semaphores are now consumed -> we are committed to returning true.
+    if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: blend submit fail"); return false; }
     f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
 
-    // ---- CPU blend: out = (prev + cur) / 2 (channel order irrelevant) ----
-    const uint8_t* cur = (const uint8_t*)sw.dlMapped;
-    uint8_t* out = (uint8_t*)sw.ulMapped;
-    size_t n = (size_t)sw.blendBytes;
-    if (sw.hasPrev) {
-        const uint8_t* prev = sw.prevFrame.data();
-        for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)((prev[i] + cur[i] + 1) >> 1);
-    } else {
-        memcpy(out, cur, n);  // no history on the first frame -> duplicate
-    }
-    memcpy(sw.prevFrame.data(), cur, n);
-    sw.hasPrev = true;
-
-    // ---- Submit #2: upload the midpoint (ulBuf) into the dst image ----
-    f.resetCmd(sw.injCmd, 0);
-    f.beginCmd(sw.injCmd, &bi);
-    b.image = dst;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcAccessMask = 0;                     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    f.copyBufToImg(sw.injCmd, sw.ulBuf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    f.barrier(sw.injCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
-    f.endCmd(sw.injCmd);
-    VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si2.commandBufferCount = 1; si2.pCommandBuffers = &sw.injCmd;
-    f.resetFences(sw.device, 1, &sw.injFence);
-    if (f.submit(queue, 1, &si2, sw.injFence) == VK_SUCCESS)
-        f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
-
-    // Present the interpolated midpoint; the caller presents the real frame.
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
@@ -415,7 +547,7 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
     orig_QueuePresent(queue, &pi);
 
     if (!sw.injLogged) {
-        LOGI("vk: blend interpolation active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
+        LOGI("vk: gpu-blend interpolation active src=%u dst=%u %ux%u", srcIndex, dstIndex, sw.extent.width, sw.extent.height);
         sw.injLogged = true;
     }
     return true;
@@ -433,7 +565,7 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
         mci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         // Need spare images so we can hold one extra in-flight frame for
         // injection without starving the game's own acquire/present loop.
-        mci.minImageCount = origMin + 2;
+        mci.minImageCount = origMin + 4;
     }
     VkResult r = orig_CreateSwapchain(device, &mci, alloc, out);
     if (r != VK_SUCCESS && g_config.present_bridge) {
