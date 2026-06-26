@@ -5,7 +5,9 @@
 #include "config.h"
 #include "log.h"
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
+#include <cerrno>
 
 namespace cleanfg {
 bool installEglHook();
@@ -14,7 +16,10 @@ bool installVulkanHook();
 
 using namespace cleanfg;
 
+// Module id is "cleanfg" (see module.prop), so Magisk installs files to
+// /data/adb/modules/cleanfg/. The config lives next to the module.
 static const char* kConfigPath = "/data/adb/modules/cleanfg/cleanfg.prop";
+static const char* kConfigName = "cleanfg.prop";
 
 class CleanFgModule : public zygisk::ModuleBase {
 public:
@@ -24,12 +29,45 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        // Решаем, целевой ли это процесс, ПО ИМЕНИ ПАКЕТА.
-        loadConfig(kConfigPath);
+        // ВАЖНО: конфиг лежит в /data/adb/modules/..., куда непривилегированный
+        // процесс приложения ДОСТУПА НЕ ИМЕЕТ (/data/adb — root-only, 0700).
+        // Поэтому читаем через root-канал:
+        //   1) getModuleDir() — fd каталога модуля, открытый демоном (root);
+        //   2) connectCompanion() — fallback, companion-процесс (root) отдаёт файл;
+        //   3) прямое чтение (работает только если процесс всё ещё root).
+        bool loaded = false;
+
+        int dirFd = api->getModuleDir();
+        if (dirFd >= 0) {
+            int cfgFd = openat(dirFd, kConfigName, O_RDONLY | O_CLOEXEC);
+            if (cfgFd >= 0) {
+                loaded = loadConfigFromFd(cfgFd);
+                close(cfgFd);
+                if (loaded) LOGI("config read via module dir fd");
+            } else {
+                LOGW("openat(moduleDir, %s) failed: %s", kConfigName, strerror(errno));
+            }
+        }
+
+        if (!loaded) {
+            int compFd = api->connectCompanion();
+            if (compFd >= 0) {
+                loaded = loadConfigFromFd(compFd);
+                close(compFd);
+                if (loaded) LOGI("config read via companion");
+            }
+        }
+
+        if (!loaded) {
+            loaded = loadConfig(kConfigPath);  // last resort
+        }
 
         const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
         targetProcess = g_config.matchesPackage(pkg);
-        if (pkg) env->ReleaseStringUTFChars(args->nice_name, pkg);
+        if (pkg) {
+            if (targetProcess) LOGI("cleanfg target matched: %s", pkg);
+            env->ReleaseStringUTFChars(args->nice_name, pkg);
+        }
 
         if (!targetProcess) {
             // Не наш процесс — выгружаем библиотеку, ничего не трогаем.
@@ -60,11 +98,22 @@ private:
     bool targetProcess = false;
 };
 
-// Companion: работает в root-контексте. Здесь только локальные файлы, без сети.
+// Companion: работает в root-контексте. Читает конфиг (недоступный из песочницы
+// приложения) и потоком отдаёт его байты в сокет, затем закрывает (→ EOF).
 static void companionHandler(int fd) {
-    // При необходимости отдавать приложению файлы/конфиг, недоступные
-    // из sandbox. Сейчас — заглушка.
-    (void)fd;
+    FILE* f = fopen(kConfigPath, "re");
+    if (!f) return;  // приложение получит EOF сразу → пустой конфиг
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(fd, buf + off, n - off);
+            if (w <= 0) { fclose(f); return; }
+            off += (size_t)w;
+        }
+    }
+    fclose(f);
 }
 
 REGISTER_ZYGISK_MODULE(CleanFgModule)

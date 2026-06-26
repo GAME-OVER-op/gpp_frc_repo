@@ -20,5 +20,10 @@ struct Config {
 };
 
 extern Config g_config;
+// Direct file read (root context only, e.g. companion). Fails from app processes
+// because /data/adb is not accessible to unprivileged UIDs.
 bool loadConfig(const char* path);
+// Read+parse config from an fd to EOF. Works for a module-dir openat fd or a
+// companion socket fd. Preferred from the app process.
+bool loadConfigFromFd(int fd);
 }

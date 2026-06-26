@@ -3,11 +3,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#include <unistd.h>
 
 namespace cleanfg {
 
 Config g_config;
-static bool g_loaded = false;
 
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -26,16 +27,16 @@ bool Config::matchesPackage(const char* name) const {
     return false;
 }
 
-bool loadConfig(const char* path) {
-    if (g_loaded) return true;
-    g_loaded = true;
-    FILE* f = fopen(path, "re");
-    if (!f) {
-        LOGW("config not found: %s", path);
-        return false;
-    }
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
+// Parse config text (in-memory). Resets g_config to defaults first so repeated
+// loads (e.g. fd fallback then file) do not accumulate duplicate targets.
+static void parseConfigText(const std::string& content) {
+    g_config.target_packages.clear();
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t nl = content.find('\n', pos);
+        std::string line = content.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? content.size() : nl + 1;
+
         std::string s = trim(line);
         if (s.empty() || s[0] == '#') continue;
         size_t eq = s.find('=');
@@ -73,11 +74,45 @@ bool loadConfig(const char* path) {
             g_config.debug = (val == "1" || val == "true");
         }
     }
-    fclose(f);
+
     LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
          g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.debug);
+}
+
+// Read an entire fd to EOF and parse it. Works for both a regular file fd
+// (openat on the module dir fd) and a companion socket fd (root process streams
+// the file then closes). Returns true if any bytes were read.
+bool loadConfigFromFd(int fd) {
+    if (fd < 0) return false;
+    std::string data;
+    char buf[1024];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) data.append(buf, (size_t)n);
+    if (data.empty()) {
+        LOGW("config fd produced no data");
+        return false;
+    }
+    parseConfigText(data);
+    return true;
+}
+
+// Direct file read. Only works from a root context (e.g. the Zygisk companion),
+// since /data/adb is not accessible to unprivileged app processes.
+bool loadConfig(const char* path) {
+    FILE* f = fopen(path, "re");
+    if (!f) {
+        LOGW("config not found / not readable: %s", path);
+        return false;
+    }
+    std::string data;
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+    fclose(f);
+    if (data.empty()) return false;
+    parseConfigText(data);
     return true;
 }
 
