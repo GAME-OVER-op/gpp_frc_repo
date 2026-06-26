@@ -23,16 +23,33 @@ if ! grep -q 'class ModuleBase' jni/zygisk.hpp 2>/dev/null; then
   grep -q REGISTER_ZYGISK_MODULE jni/zygisk.hpp || { echo "bad zygisk.hpp"; exit 1; }
 fi
 
+patch_dobby() {
+  # Dobby's arm64 closure-bridge asm uses Apple Mach-O relocation syntax
+  # (@PAGE / @PAGEOFF) that the NDK ELF assembler rejects. Rewrite to ELF form.
+  local src="$1"
+  [ -d "$src" ] || return 0
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    echo "Patching Mach-O relocations in: $f"
+    sed -i -E 's/([A-Za-z_.$][A-Za-z0-9_.$]*)@PAGEOFF/:lo12:\1/g' "$f"
+    sed -i -E 's/([A-Za-z_.$][A-Za-z0-9_.$]*)@PAGE/\1/g' "$f"
+  done < <(grep -rlE '@PAGEOFF|@PAGE' "$src" || true)
+}
+
 mkdir -p module/zygisk
 for ABI in arm64-v8a armeabi-v7a; do
   echo "== building $ABI =="
-  cmake -S jni -B "build/$ABI" -G Ninja \
+  BUILD_DIR="build/$ABI"
+  cmake -S jni -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI="$ABI" \
     -DANDROID_PLATFORM=android-26 \
-    -DCMAKE_BUILD_TYPE=Release
-  cmake --build "build/$ABI" -j"$(nproc)"
-  cp "build/$ABI/liblybfghook.so" "module/zygisk/$ABI.so"
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  patch_dobby "$BUILD_DIR/_deps/dobby-src"
+  cmake --build "$BUILD_DIR" -j"$(nproc)"
+  cp "$BUILD_DIR/liblybfghook.so" "module/zygisk/$ABI.so"
 done
 
 rm -f cleanfg-magisk.zip

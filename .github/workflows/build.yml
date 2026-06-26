@@ -54,14 +54,42 @@ jobs:
           set -eux
           mkdir -p module/zygisk
           for ABI in arm64-v8a armeabi-v7a; do
-            cmake -S jni -B "build/$ABI" \
+            BUILD_DIR="build/$ABI"
+
+            # 1) Configure (this runs FetchContent and downloads Dobby sources).
+            cmake -S jni -B "$BUILD_DIR" \
               -G Ninja \
               -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI="$ABI" \
               -DANDROID_PLATFORM=android-26 \
-              -DCMAKE_BUILD_TYPE=Release
-            cmake --build "build/$ABI" --config Release -j"$(nproc)"
-            cp "build/$ABI/liblybfghook.so" "module/zygisk/$ABI.so"
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+            # 2) Patch Dobby: its arm64 closure-bridge assembly uses Apple
+            #    Mach-O relocation syntax (@PAGE / @PAGEOFF) that the NDK r26
+            #    ELF assembler rejects. Rewrite to ELF form. Safe no-op on arm.
+            #    See Dobby issues #253 / #277.
+            DOBBY_SRC="$BUILD_DIR/_deps/dobby-src"
+            if [ -d "$DOBBY_SRC" ]; then
+              mapfile -t PAGE_FILES < <(grep -rlE '@PAGEOFF|@PAGE' "$DOBBY_SRC" || true)
+              for f in "${PAGE_FILES[@]}"; do
+                [ -n "$f" ] || continue
+                echo "Patching Mach-O relocations in: $f"
+                # @PAGEOFF first (it contains the substring @PAGE).
+                sed -i -E 's/([A-Za-z_.\$][A-Za-z0-9_.\$]*)@PAGEOFF/:lo12:\1/g' "$f"
+                sed -i -E 's/([A-Za-z_.\$][A-Za-z0-9_.\$]*)@PAGE/\1/g' "$f"
+              done
+              if grep -rqE '@PAGEOFF|@PAGE' "$DOBBY_SRC"; then
+                echo "::error::Mach-O relocation syntax still present after patch"
+                grep -rnE '@PAGEOFF|@PAGE' "$DOBBY_SRC" || true
+                exit 1
+              fi
+            fi
+
+            # 3) Build.
+            cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
+
+            cp "$BUILD_DIR/liblybfghook.so" "module/zygisk/$ABI.so"
             "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "module/zygisk/$ABI.so" || true
           done
           ls -la module/zygisk
