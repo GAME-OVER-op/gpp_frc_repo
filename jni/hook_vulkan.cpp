@@ -284,7 +284,7 @@ bool injectDuplicate(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInf
     // Acquire a destination image (CPU-wait via fence).
     uint32_t dstIndex = 0;
     f.resetFences(sw.device, 1, &sw.acqFence);
-    VkResult ar = f.acquireNextImage(sw.device, swapchain, 8000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
+    VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
         if (g_config.debug) LOGW("vk: inject acquire rc=%d", (int)ar);
         return false;
@@ -373,11 +373,16 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
     // usage. (Capture already proved TRANSFER_SRC works; we add TRANSFER_DST.)
     VkSwapchainCreateInfoKHR mci = *ci;
     VkImageUsageFlags origUsage = mci.imageUsage;
-    if (g_config.present_bridge)
+    uint32_t origMin = mci.minImageCount;
+    if (g_config.present_bridge) {
         mci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        // Need spare images so we can hold one extra in-flight frame for
+        // injection without starving the game's own acquire/present loop.
+        mci.minImageCount = origMin + 2;
+    }
     VkResult r = orig_CreateSwapchain(device, &mci, alloc, out);
     if (r != VK_SUCCESS && g_config.present_bridge) {
-        LOGW("vk: swapchain forced-usage create rc=%d; retrying with original usage", (int)r);
+        LOGW("vk: swapchain forced create rc=%d (minImages %u->%u); retrying original", (int)r, origMin, mci.minImageCount);
         r = orig_CreateSwapchain(device, ci, alloc, out);
     }
     if (r == VK_SUCCESS && out && *out) {
@@ -391,8 +396,9 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
             sw.images.resize(n);
             if (n) f.getSwapImages(device, *out, &n, sw.images.data());
         }
-        LOGI("vk: swapchain %p %ux%u fmt=%d images=%zu usage=0x%x(orig=0x%x)", (void*)*out,
+        LOGI("vk: swapchain %p %ux%u fmt=%d images=%zu minReq=%u(orig=%u) usage=0x%x(orig=0x%x)", (void*)*out,
              sw.extent.width, sw.extent.height, (int)sw.format, sw.images.size(),
+             (unsigned)mci.minImageCount, (unsigned)origMin,
              (unsigned)mci.imageUsage, (unsigned)origUsage);
         g_swaps[*out] = std::move(sw);
     }
