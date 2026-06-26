@@ -14,3 +14,4 @@ motion_strength=1.0
 blur_radius=0
 interop_bench=0
 extrap_bench=0
+extrap_dump=0

@@ -19,6 +19,7 @@
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
 #include "interop_bench.h"
 #include "extrap_bench.h"
+#include "extrap_dump.h"
 #include <atomic>
 
 namespace cleanfg {
@@ -304,6 +305,64 @@ void captureAndSubmit(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageInd
         }
         g_engine.submitFrameRGBA(sw.mapped, (int)sw.extent.width, (int)sw.extent.height, sw.rowBytes);
     }
+}
+
+// One-shot diagnostic helper: copy a swapchain image into a tightly-packed
+// host RGBA buffer (used by the extrap-dump real-frame validation). Reuses the
+// capture buffer/fence. Returns false on any failure.
+bool captureToHost(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageIndex,
+                   std::vector<uint8_t>& out, uint32_t& wOut, uint32_t& hOut) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto sit = g_swaps.find(swapchain);
+    if (sit == g_swaps.end()) return false;
+    SwapInfo& sw = sit->second;
+    DevFns& f = devFns(sw.device);
+    if (!f.ok) return false;
+    if (imageIndex >= sw.images.size()) return false;
+    if (!ensureCapture(sw, f, 0)) return false;
+
+    VkImage img = sw.images[imageIndex];
+    f.resetCmd(sw.cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    f.beginCmd(sw.cmd, &bi);
+    VkImageMemoryBarrier toSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = img;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {sw.extent.width, sw.extent.height, 1};
+    f.copyImgToBuf(sw.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sw.buffer, 1, &region);
+    VkImageMemoryBarrier toPresent = toSrc;
+    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toPresent.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+    f.endCmd(sw.cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &sw.cmd;
+    f.resetFences(sw.device, 1, &sw.fence);
+    if (f.submit(queue, 1, &si, sw.fence) != VK_SUCCESS) return false;
+    f.waitFences(sw.device, 1, &sw.fence, VK_TRUE, 200000000ULL);
+    size_t size = (size_t)sw.rowBytes * (size_t)sw.extent.height;
+    out.resize(size);
+    memcpy(out.data(), sw.mapped, size);
+    if (isBGRA(sw.format)) {
+        uint8_t* p = out.data();
+        size_t n = (size_t)sw.extent.width * (size_t)sw.extent.height;
+        for (size_t i = 0; i < n; ++i) { uint8_t t = p[i*4]; p[i*4] = p[i*4+2]; p[i*4+2] = t; }
+    }
+    wOut = sw.extent.width; hOut = sw.extent.height;
+    return true;
 }
 
 // Present-bridge Stage 1: lazily create the command buffer + fences used to
@@ -684,6 +743,44 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
                 if (sit != g_swaps.end()) { bw = sit->second.extent.width; bh = sit->second.extent.height; }
             }
             if (bw && bh) runExtrapBenchmark(bw, bh, 120);
+        }
+    }
+    // STAGE 2 one-shot real-frame extrapolation dump (opt-in via extrap_dump=1).
+    // Warms up, then captures two real consecutive frames to host, runs ME on a
+    // worker GL context, and writes prev/cur/out PPMs. Skips injection meanwhile.
+    if (info && info->swapchainCount == 1 && g_config.extrap_dump) {
+        static std::atomic<int> dumpState{0};   // 0=warmup,1=have frame1,2=done
+        static std::atomic<int> seen{0};
+        static std::vector<uint8_t> prevCpu;
+        static uint32_t pw = 0, ph = 0;
+        if (dumpState.load() < 2) {
+            int st = dumpState.load();
+            int n = seen.fetch_add(1) + 1;
+            const int kWarmup = 240, kGap = 12;
+            if (st == 0 && n >= kWarmup) {
+                std::vector<uint8_t> cur; uint32_t w = 0, h = 0;
+                if (captureToHost(queue, info->pSwapchains[0], info->pImageIndices[0], cur, w, h)) {
+                    prevCpu = std::move(cur); pw = w; ph = h;
+                    seen.store(0); dumpState.store(1);
+                    LOGI("extrap-dump: captured real frame 1 (%ux%u); keep moving", w, h);
+                }
+            } else if (st == 1 && n >= kGap) {
+                std::vector<uint8_t> cur; uint32_t w = 0, h = 0;
+                if (captureToHost(queue, info->pSwapchains[0], info->pImageIndices[0], cur, w, h)) {
+                    if (w == pw && h == ph) {
+                        std::string pkg = g_config.target_packages.empty()
+                            ? std::string("com.miHoYo.GenshinImpact") : g_config.target_packages.front();
+                        std::string dir = std::string("/data/data/") + pkg + "/";
+                        LOGI("extrap-dump: captured real frame 2 (%ux%u); running ME + writing PPMs to %s", w, h, dir.c_str());
+                        runExtrapDump(std::move(prevCpu), std::move(cur), w, h, dir);
+                        dumpState.store(2);
+                    } else {
+                        prevCpu = std::move(cur); pw = w; ph = h; seen.store(0);
+                        LOGW("extrap-dump: resolution changed, recapturing frame1 (%ux%u)", w, h);
+                    }
+                }
+            }
+            return orig_QueuePresent(queue, info);
         }
     }
     if (info) {
