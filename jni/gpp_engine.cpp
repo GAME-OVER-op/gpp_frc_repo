@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cstring>
+#include <android/dlext.h>
 
 namespace cleanfg {
 
@@ -113,8 +114,13 @@ template <class T> T sym(const char* n) {
 const char* LIB_CANDIDATES[] = {
     "libgppvppgfrcplussession.so",
     "/system/lib64/libgppvppgfrcplussession.so",
+    "/system_ext/lib64/libgppvppgfrcplussession.so",
+    "/vendor/lib64/libgppvppgfrcplussession.so",
+    "/odm/lib64/libgppvppgfrcplussession.so",
     "/data/adb/modules/gamespace/system/lib64/libgppvppgfrcplussession.so",
 };
+const char* NS_CANDIDATES[] = { "sphal", "vndk", "vndk_product", "default", "system" };
+typedef struct android_namespace_t* (*FnGetNs)(const char*);
 
 // Find RefBase subobject inside a virtually-derived object (Phase 15 logic).
 void* findRefBase(void* obj) {
@@ -195,14 +201,51 @@ bool GppEngine::resolveSymbols() {
 
 bool GppEngine::init() {
     if (ready_) return true;
+    static int attempts = 0;
+    static bool gaveUp = false;
+    if (gaveUp) return false;
+    ++attempts;
+    const bool first = (attempts == 1);
+
+    // 1) plain dlopen in the app default namespace
     for (const char* c : LIB_CANDIDATES) {
         g_lib = dlopen(c, RTLD_NOW | RTLD_GLOBAL);
         if (g_lib) { LOGI("gpp: dlopen ok: %s", c); break; }
+        if (first) { const char* e = dlerror(); LOGW("gpp: dlopen('%s'): %.140s", c, e ? e : "?"); }
     }
-    if (!g_lib) { LOGE("gpp: engine lib not found"); return false; }
+
+    // 2) android_dlopen_ext via exported linker namespaces (vendor/system HAL libs
+    //    are blocked from the app default namespace; sphal/vndk can reach them).
+    if (!g_lib) {
+        FnGetNs getNs = (FnGetNs)dlsym(RTLD_DEFAULT, "android_get_exported_namespace");
+        if (!getNs && first) LOGW("gpp: android_get_exported_namespace unavailable");
+        if (getNs) {
+            for (const char* nsn : NS_CANDIDATES) {
+                struct android_namespace_t* ns = getNs(nsn);
+                if (!ns) { if (first) LOGW("gpp: ns '%s' missing", nsn); continue; }
+                android_dlextinfo info;
+                memset(&info, 0, sizeof(info));
+                info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+                info.library_namespace = ns;
+                for (const char* c : LIB_CANDIDATES) {
+                    if (c[0] != '/') continue;  // namespace load needs absolute path
+                    g_lib = android_dlopen_ext(c, RTLD_NOW | RTLD_GLOBAL, &info);
+                    if (g_lib) { LOGI("gpp: dlopen_ext ok ns=%s: %s", nsn, c); break; }
+                    if (first) { const char* e = dlerror(); LOGW("gpp: dlopen_ext ns=%s '%s': %.120s", nsn, c, e ? e : "?"); }
+                }
+                if (g_lib) break;
+            }
+        }
+    }
+
+    if (!g_lib) {
+        if (first) LOGE("gpp: engine lib not found (paths+namespaces exhausted)");
+        if (attempts >= 4) { gaveUp = true; LOGE("gpp: giving up on engine lib load"); }
+        return false;
+    }
     dlopen("libgui.so", RTLD_NOW | RTLD_GLOBAL);
     dlopen("libui.so",  RTLD_NOW | RTLD_GLOBAL);
-    if (!resolveSymbols()) { LOGE("gpp: key symbols unresolved"); return false; }
+    if (!resolveSymbols()) { LOGE("gpp: key symbols unresolved"); gaveUp = true; return false; }
     ready_ = true;
     LOGI("gpp: engine ready");
     return true;
