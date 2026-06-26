@@ -260,33 +260,90 @@ VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
     return r;
 }
 
+// --- Interceptor for vkGet*ProcAddr ---------------------------------------
+// Unity/Genshin resolves Vulkan entry points through vkGetInstanceProcAddr /
+// vkGetDeviceProcAddr and calls the driver dispatch directly, bypassing the
+// exported libvulkan.so symbols (which is why hooking the exported
+// vkQueuePresentKHR/vkCreateSwapchainKHR was inert). So we hook the two
+// Get*ProcAddr resolvers and hand back our wrappers for the entry points we
+// care about. pGIPA/pGDPA always hold the REAL resolvers.
+PFN_vkVoidFunction VKAPI_PTR my_GetDeviceProcAddr(VkDevice dev, const char* name) {
+    if (!name) return nullptr;
+    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)my_GetDeviceProcAddr;
+    PFN_vkVoidFunction real = pGDPA ? pGDPA(dev, name) : nullptr;
+    if (!real) return nullptr;
+    if (!strcmp(name, "vkQueuePresentKHR")) {
+        orig_QueuePresent = (PFN_vkQueuePresentKHR)real;
+        LOGI("vk: intercepted vkQueuePresentKHR via gdpa");
+        return (PFN_vkVoidFunction)my_QueuePresent;
+    }
+    if (!strcmp(name, "vkCreateSwapchainKHR")) {
+        orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)real;
+        LOGI("vk: intercepted vkCreateSwapchainKHR via gdpa");
+        return (PFN_vkVoidFunction)my_CreateSwapchain;
+    }
+    return real;
+}
+
+PFN_vkVoidFunction VKAPI_PTR my_GetInstanceProcAddr(VkInstance inst, const char* name) {
+    if (!name) return nullptr;
+    if (!strcmp(name, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)my_GetInstanceProcAddr;
+    PFN_vkVoidFunction real = pGIPA ? pGIPA(inst, name) : nullptr;
+    if (!strcmp(name, "vkGetDeviceProcAddr")) {
+        if (real) pGDPA = (PFN_vkGetDeviceProcAddr)real;
+        return (PFN_vkVoidFunction)my_GetDeviceProcAddr;
+    }
+    if (!strcmp(name, "vkCreateDevice")) {
+        if (real) orig_CreateDevice = (PFN_vkCreateDevice)real;
+        return (PFN_vkVoidFunction)my_CreateDevice;
+    }
+    if (!real) return nullptr;
+    if (!strcmp(name, "vkCreateSwapchainKHR")) {
+        orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)real;
+        return (PFN_vkVoidFunction)my_CreateSwapchain;
+    }
+    if (!strcmp(name, "vkQueuePresentKHR")) {
+        orig_QueuePresent = (PFN_vkQueuePresentKHR)real;
+        return (PFN_vkVoidFunction)my_QueuePresent;
+    }
+    return real;
+}
+
 }  // anonymous namespace
 
 bool installVulkanHook() {
     void* libvk = dlopen("libvulkan.so", RTLD_NOW | RTLD_GLOBAL);
     if (!libvk) { LOGW("libvulkan.so not present, skip vulkan hook"); return false; }
-    pGIPA = (PFN_vkGetInstanceProcAddr)dlsym(libvk, "vkGetInstanceProcAddr");
-    pGDPA = (PFN_vkGetDeviceProcAddr)dlsym(libvk, "vkGetDeviceProcAddr");
     pGetMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)dlsym(libvk, "vkGetPhysicalDeviceMemoryProperties");
 
-    void* present = dlsym(libvk, "vkQueuePresentKHR");
-    void* createSwap = dlsym(libvk, "vkCreateSwapchainKHR");
-    void* createDev  = dlsym(libvk, "vkCreateDevice");
+    void* gipa = dlsym(libvk, "vkGetInstanceProcAddr");
+    void* gdpa = dlsym(libvk, "vkGetDeviceProcAddr");
+    // REAL resolvers (must never point at our wrappers).
+    pGIPA = (PFN_vkGetInstanceProcAddr)gipa;
+    pGDPA = (PFN_vkGetDeviceProcAddr)gdpa;
+
     bool any = false;
-    if (createDev) {
-        void* t = hookFunction(createDev, (void*)my_CreateDevice);
-        if (t) { orig_CreateDevice = (PFN_vkCreateDevice)t; any = true; }
+    // PRIMARY: intercept the proc-address resolvers so we catch the
+    // driver-dispatched entry points the engine actually calls.
+    if (gipa) {
+        void* t = hookFunction(gipa, (void*)my_GetInstanceProcAddr);
+        if (t) { pGIPA = (PFN_vkGetInstanceProcAddr)t; any = true; }
     }
-    if (createSwap) {
-        void* t = hookFunction(createSwap, (void*)my_CreateSwapchain);
-        if (t) { orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)t; any = true; }
+    if (gdpa) {
+        void* t = hookFunction(gdpa, (void*)my_GetDeviceProcAddr);
+        if (t) { pGDPA = (PFN_vkGetDeviceProcAddr)t; any = true; }
     }
-    if (present) {
-        void* t = hookFunction(present, (void*)my_QueuePresent);
-        if (t) { orig_QueuePresent = (PFN_vkQueuePresentKHR)t; any = true; }
-    }
-    if (any) LOGI("vk: hooks installed (present=%p swap=%p dev=%p)", present, createSwap, createDev);
-    else LOGE("vk: failed to install hooks");
+    // BELT-AND-SUSPENDERS: also hook the exported entry points, in case the app
+    // calls them directly. Harmless if never invoked.
+    void* createDev  = dlsym(libvk, "vkCreateDevice");
+    void* createSwap = dlsym(libvk, "vkCreateSwapchainKHR");
+    void* present    = dlsym(libvk, "vkQueuePresentKHR");
+    if (createDev)  { void* t = hookFunction(createDev,  (void*)my_CreateDevice);    if (t && !orig_CreateDevice)    orig_CreateDevice    = (PFN_vkCreateDevice)t; }
+    if (createSwap) { void* t = hookFunction(createSwap, (void*)my_CreateSwapchain); if (t && !orig_CreateSwapchain) orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)t; }
+    if (present)    { void* t = hookFunction(present,    (void*)my_QueuePresent);    if (t && !orig_QueuePresent)    orig_QueuePresent    = (PFN_vkQueuePresentKHR)t; }
+
+    if (any) LOGI("vk: proc-addr interception installed (gipa=%p gdpa=%p)", gipa, gdpa);
+    else LOGE("vk: failed to install proc-addr interception");
     return any;
 }
 
