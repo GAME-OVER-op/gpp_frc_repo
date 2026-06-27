@@ -73,6 +73,15 @@ vec2 flowAt(vec2 px) {
     vec2 f11 = flow[y1 * pc.tilesX + x1];
     return mix(mix(f00, f10, fr.x), mix(f01, f11, fr.x), fr.y);
 }
+// Soft in-bounds weight: 1.0 when q is >= m px inside every edge, ramping to
+// 0.0 at/beyond the border. Used to detect disocclusion at the frame edges.
+float edgeWeight(vec2 q, float m) {
+    float l = clamp(q.x / m, 0.0, 1.0);
+    float r = clamp((float(pc.width  - 1) - q.x) / m, 0.0, 1.0);
+    float u = clamp(q.y / m, 0.0, 1.0);
+    float d = clamp((float(pc.height - 1) - q.y) / m, 0.0, 1.0);
+    return min(min(l, r), min(u, d));
+}
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= pc.width || p.y >= pc.height) return;
@@ -80,28 +89,61 @@ void main() {
     vec2 mv = flowAt(x);
     float t = pc.t;
 
-    // Bilinear is smoother but 4 reads/fetch; nearest is the perf default.
-    vec4 pv = (pc.bilinear != 0) ? biPrev(x - t * mv)         : nnPrev(x - t * mv);
-    vec4 cv = (pc.bilinear != 0) ? biCur (x + (1.0 - t) * mv) : nnCur (x + (1.0 - t) * mv);
+    // Motion-compensated source positions (before clamping) so we can tell when
+    // a fetch leaves the real frame content -- the border disocclusion case
+    // (new content sliding in at the edge during a camera turn).
+    vec2 pPos = x - t * mv;
+    vec2 cPos = x + (1.0 - t) * mv;
 
+    // Soft validity of each tap. The ramp width scales with motion so fast
+    // edges get a wider, seam-free hand-off instead of a hard line.
+    float margin = clamp(length(mv) * 0.5, 2.0, 24.0);
+    float wp = edgeWeight(pPos, margin);
+    float wc = edgeWeight(cPos, margin);
+
+    // Bilinear is smoother but 4 reads/fetch; nearest is the perf default.
+    vec4 pv = (pc.bilinear != 0) ? biPrev(pPos) : nnPrev(pPos);
+    vec4 cv = (pc.bilinear != 0) ? biCur (cPos) : nnCur (cPos);
+
+    // Interior result: existing occlusion-aware blend.
+    vec4 mc;
     float dl  = abs(luma(pv) - luma(cv));
     float occ = clamp((dl - pc.occl) / max(pc.occl, 1e-3), 0.0, 1.0);
-
-    vec4 res;
     if (occ < 0.001) {
-        res = mix(pv, cv, t);                       // vector trustworthy: linear blend
+        mc = mix(pv, cv, t);                        // vector trustworthy: linear blend
     } else {
         float trustPrev = 0.5;
         if (pc.useAccel != 0) {
             // Extrapolate one more step back along the same motion and compare
             // prev with prev2: a side consistent with its own history is the
             // real (occluded) content -> trust it.
-            vec4 p2 = biPrev2(x - t * mv - mv);
+            vec4 p2 = biPrev2(pPos - mv);
             float stab = abs(luma(pv) - luma(p2));
             trustPrev = 1.0 - clamp(stab / max(pc.occl, 1e-3), 0.0, 1.0);
         }
         vec4 chosen = mix(cv, pv, trustPrev);
-        res = mix(mix(pv, cv, t), chosen, occ);
+        mc = mix(mix(pv, cv, t), chosen, occ);
+    }
+
+    // Border / disocclusion correction: weight each tap by its temporal share
+    // (1-t for prev, t for cur) AND its validity, then renormalise. Where one
+    // side is off-frame (newly revealed content), this smoothly hands over to
+    // the side that actually has the pixels, killing the edge smear/ghosting.
+    float pw  = (1.0 - t) * wp;
+    float cw  = t * wc;
+    float sum = pw + cw;
+
+    vec4 res;
+    if (sum < 1e-4) {
+        // Both taps off-frame: fall back to the true current pixel (identity)
+        // so freshly revealed edges show real content, not a smear.
+        res = (pc.bilinear != 0) ? biCur(x) : nnCur(x);
+    } else {
+        vec4 vw = (pv * pw + cv * cw) / sum;
+        // Apply the validity blend only near a border (asymmetric validity);
+        // the interior (wp == wc == 1) keeps the full occlusion-aware result.
+        float border = 1.0 - min(wp, wc);
+        res = mix(mc, vw, border);
     }
     imageStore(outImg, p, res);
 }
