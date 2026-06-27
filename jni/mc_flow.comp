@@ -1,0 +1,67 @@
+#version 450
+// cleanfg motion estimation (Stage 2C).
+// Per-tile block matching with a coarse-to-fine (logarithmic) search between the
+// two most recent real frames. Produces a low-resolution flow field: one vec2
+// per tile describing the prev->cur displacement of that tile's content. The
+// field is intentionally low-res (real motion is smooth / low-frequency); the
+// warp pass upsamples it and renders the result at full resolution.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly  image2D prevImg;
+layout(set = 0, binding = 1, rgba8) uniform readonly  image2D curImg;
+layout(set = 0, binding = 2, rgba8) uniform readonly  image2D prev2Img; // unused in this pass
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D outImg;   // unused in this pass
+layout(std430, set = 0, binding = 4) buffer FlowBuf { vec2 flow[]; };
+layout(push_constant) uniform PC {
+    int width; int height; int tilesX; int tilesY;
+    int tile;  int search; int levels; int useAccel;
+    float t;   float occl;
+} pc;
+
+float lumaP(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    return dot(imageLoad(prevImg, p).rgb, vec3(0.299, 0.587, 0.114));
+}
+float lumaC(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    return dot(imageLoad(curImg, p).rgb, vec3(0.299, 0.587, 0.114));
+}
+// Sum of absolute luma differences over a sparse block centred at c, comparing
+// prev(c + blk) with cur(c + mv + blk).
+float cost(ivec2 c, ivec2 mv, int rad, int step) {
+    float s = 0.0;
+    for (int dy = -rad; dy <= rad; dy += step)
+    for (int dx = -rad; dx <= rad; dx += step) {
+        ivec2 q = c + ivec2(dx, dy);
+        s += abs(lumaP(q) - lumaC(q + mv));
+    }
+    return s;
+}
+void main() {
+    ivec2 tl = ivec2(gl_GlobalInvocationID.xy);
+    if (tl.x >= pc.tilesX || tl.y >= pc.tilesY) return;
+    ivec2 c   = tl * pc.tile + ivec2(pc.tile / 2);
+    int   rad = max(2, pc.tile / 2);
+    int   bst = max(1, pc.tile / 8);
+
+    vec2  best     = vec2(0.0);
+    float bestCost = cost(c, ivec2(0), rad, bst);
+
+    ivec2 dirs[8] = ivec2[8](
+        ivec2( 1, 0), ivec2(-1, 0), ivec2( 0, 1), ivec2( 0,-1),
+        ivec2( 1, 1), ivec2( 1,-1), ivec2(-1, 1), ivec2(-1,-1));
+
+    int step = clamp(pc.search, 1, 256);
+    int lv   = max(1, pc.levels);
+    for (int level = 0; level < lv; ++level) {
+        bool improved = false;
+        for (int j = 0; j < 8; ++j) {
+            vec2 cand = best + vec2(dirs[j]) * float(step);
+            if (abs(cand.x) > float(pc.search) || abs(cand.y) > float(pc.search)) continue;
+            float cc = cost(c, ivec2(round(cand)), rad, bst);
+            if (cc < bestCost) { bestCost = cc; best = cand; improved = true; }
+        }
+        if (step <= 1 && !improved) break;
+        step = max(1, step / 2);
+    }
+    flow[tl.y * pc.tilesX + tl.x] = best;
+}

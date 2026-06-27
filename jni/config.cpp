@@ -84,6 +84,23 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "multiplier") {
             g_config.multiplier = atoi(val.c_str());
             if (g_config.multiplier < 1) g_config.multiplier = 1;
+        } else if (key == "warmup_frames") {
+            g_config.warmup_frames = atoi(val.c_str());
+            if (g_config.warmup_frames < 0) g_config.warmup_frames = 0;
+        } else if (key == "mc_interp") {
+            g_config.mc_interp = (val == "1" || val == "true");
+        } else if (key == "mc_tile") {
+            g_config.mc_tile = atoi(val.c_str());
+            if (g_config.mc_tile < 4) g_config.mc_tile = 4;
+        } else if (key == "mc_search") {
+            g_config.mc_search = atoi(val.c_str());
+            if (g_config.mc_search < 1) g_config.mc_search = 1;
+        } else if (key == "mc_levels") {
+            g_config.mc_levels = atoi(val.c_str());
+            if (g_config.mc_levels < 1) g_config.mc_levels = 1;
+        } else if (key == "mc_occl") {
+            g_config.mc_occl = (float)atof(val.c_str());
+            if (g_config.mc_occl < 0.001f) g_config.mc_occl = 0.001f;
         } else if (key == "method") {
             g_config.method = (val == "extrapolate" || val == "reproject") ? Method::Extrapolate : Method::Blend;
         } else if (key == "max_fps") {
@@ -119,14 +136,17 @@ static void parseConfigText(const std::string& content) {
         }
     }
 
-    LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
+    LOGI("config loaded: %zu target(s), mode=%d mult=%d warmup=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
-         g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
+         g_config.warmup_frames, g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
     LOGI("interop_bench=%d", g_config.interop_bench);
+    LOGI("mc params: interp=%d tile=%d search=%d levels=%d occl=%.3f",
+         g_config.mc_interp, g_config.mc_tile, g_config.mc_search,
+         g_config.mc_levels, g_config.mc_occl);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
     LOGI("extrap_eval=%d", g_config.extrap_eval);
 }

@@ -1,0 +1,95 @@
+#version 450
+// cleanfg motion-compensated interpolation (Stage 2C).
+// Builds the intermediate (phase t) frame by bilateral motion compensation: for
+// each output pixel, look up the upsampled flow vector, sample prev backward
+// along -t*mv and cur forward along +(1-t)*mv, then blend. Where the two motion-
+// compensated samples disagree (occlusion / unreliable vector) it falls back,
+// using the third history frame (prev2) to decide which side to trust.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly  image2D prevImg;
+layout(set = 0, binding = 1, rgba8) uniform readonly  image2D curImg;
+layout(set = 0, binding = 2, rgba8) uniform readonly  image2D prev2Img;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D outImg;
+layout(std430, set = 0, binding = 4) buffer FlowBuf { vec2 flow[]; };
+layout(push_constant) uniform PC {
+    int width; int height; int tilesX; int tilesY;
+    int tile;  int search; int levels; int useAccel;
+    float t;   float occl;
+} pc;
+
+float luma(vec4 c) { return dot(c.rgb, vec3(0.299, 0.587, 0.114)); }
+
+vec4 biPrev(vec2 p) {
+    p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
+    ivec2 i  = ivec2(floor(p)); vec2 fr = p - vec2(i);
+    ivec2 i1 = ivec2(min(i.x + 1, pc.width - 1), min(i.y + 1, pc.height - 1));
+    vec4 a = imageLoad(prevImg, i);
+    vec4 b = imageLoad(prevImg, ivec2(i1.x, i.y));
+    vec4 c = imageLoad(prevImg, ivec2(i.x, i1.y));
+    vec4 d = imageLoad(prevImg, i1);
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+vec4 biCur(vec2 p) {
+    p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
+    ivec2 i  = ivec2(floor(p)); vec2 fr = p - vec2(i);
+    ivec2 i1 = ivec2(min(i.x + 1, pc.width - 1), min(i.y + 1, pc.height - 1));
+    vec4 a = imageLoad(curImg, i);
+    vec4 b = imageLoad(curImg, ivec2(i1.x, i.y));
+    vec4 c = imageLoad(curImg, ivec2(i.x, i1.y));
+    vec4 d = imageLoad(curImg, i1);
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+vec4 biPrev2(vec2 p) {
+    p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
+    ivec2 i  = ivec2(floor(p)); vec2 fr = p - vec2(i);
+    ivec2 i1 = ivec2(min(i.x + 1, pc.width - 1), min(i.y + 1, pc.height - 1));
+    vec4 a = imageLoad(prev2Img, i);
+    vec4 b = imageLoad(prev2Img, ivec2(i1.x, i.y));
+    vec4 c = imageLoad(prev2Img, ivec2(i.x, i1.y));
+    vec4 d = imageLoad(prev2Img, i1);
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+// Bilinear lookup of the per-tile flow field at full-res pixel index px.
+vec2 flowAt(vec2 px) {
+    vec2 g = (px - vec2(float(pc.tile) * 0.5)) / float(pc.tile);
+    g = clamp(g, vec2(0.0), vec2(pc.tilesX - 1, pc.tilesY - 1));
+    ivec2 i  = ivec2(floor(g)); vec2 fr = g - vec2(i);
+    int x1 = min(i.x + 1, pc.tilesX - 1);
+    int y1 = min(i.y + 1, pc.tilesY - 1);
+    vec2 f00 = flow[i.y * pc.tilesX + i.x];
+    vec2 f10 = flow[i.y * pc.tilesX + x1];
+    vec2 f01 = flow[y1 * pc.tilesX + i.x];
+    vec2 f11 = flow[y1 * pc.tilesX + x1];
+    return mix(mix(f00, f10, fr.x), mix(f01, f11, fr.x), fr.y);
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    vec2 x  = vec2(p);              // pixel-index space (mv == 0 -> identity)
+    vec2 mv = flowAt(x);
+    float t = pc.t;
+
+    vec4 pv = biPrev(x - t * mv);
+    vec4 cv = biCur (x + (1.0 - t) * mv);
+
+    float dl  = abs(luma(pv) - luma(cv));
+    float occ = clamp((dl - pc.occl) / max(pc.occl, 1e-3), 0.0, 1.0);
+
+    vec4 res;
+    if (occ < 0.001) {
+        res = mix(pv, cv, t);                       // vector trustworthy: linear blend
+    } else {
+        float trustPrev = 0.5;
+        if (pc.useAccel != 0) {
+            // Extrapolate one more step back along the same motion and compare
+            // prev with prev2: a side consistent with its own history is the
+            // real (occluded) content -> trust it.
+            vec4 p2 = biPrev2(x - t * mv - mv);
+            float stab = abs(luma(pv) - luma(p2));
+            trustPrev = 1.0 - clamp(stab / max(pc.occl, 1e-3), 0.0, 1.0);
+        }
+        vec4 chosen = mix(cv, pv, trustPrev);
+        res = mix(mix(pv, cv, t), chosen, occ);
+    }
+    imageStore(outImg, p, res);
+}

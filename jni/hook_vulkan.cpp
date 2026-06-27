@@ -17,6 +17,8 @@
 #include <mutex>
 #include <cstring>
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
+#include "mc_flow_comp.h"  // generated at build time (glslangValidator --vn mc_flow_comp_spv)
+#include "mc_warp_comp.h"  // generated at build time (glslangValidator --vn mc_warp_comp_spv)
 #include "interop_bench.h"
 #include "extrap_bench.h"
 #include "extrap_eval.h"
@@ -70,6 +72,19 @@ struct DevFns {
     PFN_vkCmdBindDescriptorSets       cmdBindDescSets = nullptr;
     PFN_vkCmdDispatch                 cmdDispatch = nullptr;
     PFN_vkCmdPushConstants            cmdPushConst = nullptr;
+    // teardown entry points (resolved for swapchain-destroy cleanup)
+    PFN_vkDeviceWaitIdle              deviceWaitIdle = nullptr;
+    PFN_vkDestroyCommandPool          destroyPool = nullptr;
+    PFN_vkDestroyFence                destroyFence = nullptr;
+    PFN_vkDestroyBuffer               destroyBuffer = nullptr;
+    PFN_vkFreeMemory                  freeMem = nullptr;
+    PFN_vkDestroyImage                destroyImage = nullptr;
+    PFN_vkDestroyImageView            destroyImageView = nullptr;
+    PFN_vkDestroyDescriptorPool       destroyDescPool = nullptr;
+    PFN_vkDestroyDescriptorSetLayout  destroyDescSetLayout = nullptr;
+    PFN_vkDestroyPipeline             destroyPipeline = nullptr;
+    PFN_vkDestroyPipelineLayout       destroyPipeLayout = nullptr;
+    PFN_vkDestroyShaderModule         destroyShaderModule = nullptr;
     VkPhysicalDevice            phys = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps{};
     bool ok = false;
@@ -122,6 +137,24 @@ struct SwapInfo {
     VkShaderModule gShader = VK_NULL_HANDLE;
     bool gHasPrev = false;
     bool gpuReady = false;
+    // --- Stage 2C: motion-compensated interpolation resources ---
+    VkImage gPrev2 = VK_NULL_HANDLE;
+    VkDeviceMemory gPrev2Mem = VK_NULL_HANDLE;
+    VkImageView gPrev2View = VK_NULL_HANDLE;
+    VkBuffer mcFlowBuf = VK_NULL_HANDLE;
+    VkDeviceMemory mcFlowMem = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mcDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mcDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet mcDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout mcPipeLayout = VK_NULL_HANDLE;
+    VkPipeline mcFlowPipe = VK_NULL_HANDLE;
+    VkPipeline mcWarpPipe = VK_NULL_HANDLE;
+    VkShaderModule mcFlowShader = VK_NULL_HANDLE;
+    VkShaderModule mcWarpShader = VK_NULL_HANDLE;
+    int mcTilesX = 0, mcTilesY = 0;
+    int mcHist = 0;          // 0 = no history, 1 = have prev, 2+ = have prev & prev2
+    bool mcReady = false;
+    bool mcLogged = false;
 };
 
 std::mutex g_mtx;
@@ -131,6 +164,7 @@ std::unordered_map<VkDevice, VkPhysicalDevice> g_devPhys;
 std::unordered_map<VkSurfaceKHR, void*> g_surfWindow;  // VkSurfaceKHR -> ANativeWindow*
 
 PFN_vkCreateSwapchainKHR orig_CreateSwapchain = nullptr;
+PFN_vkDestroySwapchainKHR orig_DestroySwapchain = nullptr;
 PFN_vkQueuePresentKHR    orig_QueuePresent = nullptr;
 PFN_vkCreateDevice       orig_CreateDevice = nullptr;
 PFN_vkCreateAndroidSurfaceKHR orig_CreateAndroidSurface = nullptr;
@@ -179,6 +213,18 @@ DevFns& devFns(VkDevice dev) {
     f.cmdBindDescSets        = (PFN_vkCmdBindDescriptorSets)G("vkCmdBindDescriptorSets");
     f.cmdDispatch            = (PFN_vkCmdDispatch)G("vkCmdDispatch");
     f.cmdPushConst           = (PFN_vkCmdPushConstants)G("vkCmdPushConstants");
+    f.deviceWaitIdle         = (PFN_vkDeviceWaitIdle)G("vkDeviceWaitIdle");
+    f.destroyPool            = (PFN_vkDestroyCommandPool)G("vkDestroyCommandPool");
+    f.destroyFence           = (PFN_vkDestroyFence)G("vkDestroyFence");
+    f.destroyBuffer          = (PFN_vkDestroyBuffer)G("vkDestroyBuffer");
+    f.freeMem                = (PFN_vkFreeMemory)G("vkFreeMemory");
+    f.destroyImage           = (PFN_vkDestroyImage)G("vkDestroyImage");
+    f.destroyImageView       = (PFN_vkDestroyImageView)G("vkDestroyImageView");
+    f.destroyDescPool        = (PFN_vkDestroyDescriptorPool)G("vkDestroyDescriptorPool");
+    f.destroyDescSetLayout   = (PFN_vkDestroyDescriptorSetLayout)G("vkDestroyDescriptorSetLayout");
+    f.destroyPipeline        = (PFN_vkDestroyPipeline)G("vkDestroyPipeline");
+    f.destroyPipeLayout      = (PFN_vkDestroyPipelineLayout)G("vkDestroyPipelineLayout");
+    f.destroyShaderModule    = (PFN_vkDestroyShaderModule)G("vkDestroyShaderModule");
     auto pit = g_devPhys.find(dev);
     if (pit != g_devPhys.end()) {
         f.phys = pit->second;
@@ -524,6 +570,357 @@ bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
     return true;
 }
 
+// ===================== STAGE 2C: motion-compensated interpolation ============
+// Push-constant block shared by mc_flow.comp and mc_warp.comp. The field order
+// MUST match the GLSL push_constant block exactly (all 4-byte scalars).
+struct McPC {
+    int32_t width, height, tilesX, tilesY;
+    int32_t tile, search, levels, useAccel;
+    float t, occl;
+};
+
+// Allocate the extra resources MC interpolation needs on top of the GPU-blend
+// images (which provide gPrev/gCur/gOut + their views). Adds a third history
+// image (gPrev2), a device-local flow SSBO, a 5-binding descriptor set and the
+// two compute pipelines (estimate + warp). Requires ensureGpuBlend first.
+bool ensureMcInterp(SwapInfo& sw, DevFns& f) {
+    if (sw.mcReady) return true;
+    if (!sw.gpuReady) return false;  // needs gPrev/gCur/gOut + views
+    if (!f.createBuf || !f.getBufReq || !f.allocMem || !f.bindBufMem ||
+        !f.createImage || !f.getImgReq || !f.bindImgMem || !f.createImageView ||
+        !f.createDescSetLayout || !f.createDescPool || !f.allocDescSets || !f.updateDescSets ||
+        !f.createPipeLayout || !f.createShaderModule || !f.createComputePipelines) {
+        LOGE("vk: mc-interp missing device fns"); return false;
+    }
+    const VkFormat fmt = sw.format;
+
+    // (1) gPrev2 storage image (mirror of ensureGpuBlend's mkImg).
+    {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = {sw.extent.width, sw.extent.height, 1};
+        ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (f.createImage(sw.device, &ici, nullptr, &sw.gPrev2) != VK_SUCCESS) { LOGE("vk: mc prev2 img fail"); return false; }
+        VkMemoryRequirements mr{}; f.getImgReq(sw.device, sw.gPrev2, &mr);
+        int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
+        if (f.allocMem(sw.device, &mai, nullptr, &sw.gPrev2Mem) != VK_SUCCESS) return false;
+        if (f.bindImgMem(sw.device, sw.gPrev2, sw.gPrev2Mem, 0) != VK_SUCCESS) return false;
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = sw.gPrev2; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (f.createImageView(sw.device, &vci, nullptr, &sw.gPrev2View) != VK_SUCCESS) { LOGE("vk: mc prev2 view fail"); return false; }
+    }
+
+    // (2) Flow SSBO (one vec2 per tile), device-local.
+    int tile = g_config.mc_tile > 0 ? g_config.mc_tile : 16;
+    sw.mcTilesX = (int)((sw.extent.width  + tile - 1) / tile);
+    sw.mcTilesY = (int)((sw.extent.height + tile - 1) / tile);
+    VkDeviceSize flowSize = (VkDeviceSize)sw.mcTilesX * (VkDeviceSize)sw.mcTilesY * 2 * sizeof(float);
+    if (flowSize < 8) flowSize = 8;
+    {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = flowSize;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (f.createBuf(sw.device, &bci, nullptr, &sw.mcFlowBuf) != VK_SUCCESS) { LOGE("vk: mc flow buf fail"); return false; }
+        VkMemoryRequirements mr{}; f.getBufReq(sw.device, sw.mcFlowBuf, &mr);
+        int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
+        if (f.allocMem(sw.device, &mai, nullptr, &sw.mcFlowMem) != VK_SUCCESS) return false;
+        if (f.bindBufMem(sw.device, sw.mcFlowBuf, sw.mcFlowMem, 0) != VK_SUCCESS) return false;
+    }
+
+    // (3) Descriptor set: 4 storage images (prev,cur,prev2,out) + 1 storage buffer (flow).
+    VkDescriptorSetLayoutBinding binds[5]{};
+    for (int i = 0; i < 4; ++i) {
+        binds[i].binding = (uint32_t)i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    binds[4].binding = 4;
+    binds[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binds[4].descriptorCount = 1;
+    binds[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dlci.bindingCount = 5; dlci.pBindings = binds;
+    if (f.createDescSetLayout(sw.device, &dlci, nullptr, &sw.mcDescLayout) != VK_SUCCESS) { LOGE("vk: mc desc layout fail"); return false; }
+
+    VkDescriptorPoolSize psz[2]{ {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1} };
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1; dpci.poolSizeCount = 2; dpci.pPoolSizes = psz;
+    if (f.createDescPool(sw.device, &dpci, nullptr, &sw.mcDescPool) != VK_SUCCESS) { LOGE("vk: mc desc pool fail"); return false; }
+
+    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = sw.mcDescPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &sw.mcDescLayout;
+    if (f.allocDescSets(sw.device, &dsai, &sw.mcDescSet) != VK_SUCCESS) { LOGE("vk: mc desc set fail"); return false; }
+
+    VkDescriptorImageInfo dii[4]{};
+    dii[0].imageView = sw.gPrevView;  dii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dii[1].imageView = sw.gCurView;   dii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dii[2].imageView = sw.gPrev2View; dii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dii[3].imageView = sw.gOutView;   dii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorBufferInfo dbi{}; dbi.buffer = sw.mcFlowBuf; dbi.offset = 0; dbi.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet wds[5]{};
+    for (int i = 0; i < 4; ++i) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = sw.mcDescSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wds[i].pImageInfo = &dii[i];
+    }
+    wds[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wds[4].dstSet = sw.mcDescSet; wds[4].dstBinding = 4; wds[4].descriptorCount = 1;
+    wds[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[4].pBufferInfo = &dbi;
+    f.updateDescSets(sw.device, 5, wds, 0, nullptr);
+
+    // (4) Shader modules.
+    {
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = sizeof(mc_flow_comp_spv); smci.pCode = mc_flow_comp_spv;
+        if (f.createShaderModule(sw.device, &smci, nullptr, &sw.mcFlowShader) != VK_SUCCESS) { LOGE("vk: mc flow shader fail"); return false; }
+    }
+    {
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = sizeof(mc_warp_comp_spv); smci.pCode = mc_warp_comp_spv;
+        if (f.createShaderModule(sw.device, &smci, nullptr, &sw.mcWarpShader) != VK_SUCCESS) { LOGE("vk: mc warp shader fail"); return false; }
+    }
+
+    // (5) Shared pipeline layout (McPC push range) + two compute pipelines.
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(McPC)};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1; plci.pSetLayouts = &sw.mcDescLayout;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (f.createPipeLayout(sw.device, &plci, nullptr, &sw.mcPipeLayout) != VK_SUCCESS) { LOGE("vk: mc pipe layout fail"); return false; }
+
+    VkComputePipelineCreateInfo cf{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cf.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cf.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cf.stage.module = sw.mcFlowShader; cf.stage.pName = "main";
+    cf.layout = sw.mcPipeLayout;
+    if (f.createComputePipelines(sw.device, VK_NULL_HANDLE, 1, &cf, nullptr, &sw.mcFlowPipe) != VK_SUCCESS) { LOGE("vk: mc flow pipeline fail"); return false; }
+
+    VkComputePipelineCreateInfo cw{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cw.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cw.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cw.stage.module = sw.mcWarpShader; cw.stage.pName = "main";
+    cw.layout = sw.mcPipeLayout;
+    if (f.createComputePipelines(sw.device, VK_NULL_HANDLE, 1, &cw, nullptr, &sw.mcWarpPipe) != VK_SUCCESS) { LOGE("vk: mc warp pipeline fail"); return false; }
+
+    sw.mcHist = 0;
+    sw.mcReady = true;
+    LOGI("vk: mc-interp ready %ux%u tiles=%dx%d tile=%d search=%d levels=%d",
+         sw.extent.width, sw.extent.height, sw.mcTilesX, sw.mcTilesY, tile,
+         g_config.mc_search, g_config.mc_levels);
+    return true;
+}
+
+// Motion-compensated equivalent of injectBlend: estimates real prev->cur motion
+// (mc_flow), warps to the midpoint at full resolution (mc_warp) and presents the
+// generated frame before the real one. Keeps a 3-frame history (prev2/prev/cur).
+// Warmup frames present a duplicate so this is a single consistent code path
+// (never falls back to blend mid-stream once ensureMcInterp succeeds).
+bool injectMcInterp(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR* info, uint32_t srcIndex) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto sit = g_swaps.find(swapchain);
+    if (sit == g_swaps.end()) return false;
+    SwapInfo& sw = sit->second;
+    DevFns& f = devFns(sw.device);
+    if (!f.ok || !f.acquireNextImage || !f.cmdCopyImage || !f.cmdDispatch) return false;
+    if (srcIndex >= sw.images.size()) return false;
+    if (!ensureInject(sw, f)) return false;
+    if (!ensureGpuBlend(sw, f)) return false;
+    if (!ensureMcInterp(sw, f)) return false;
+
+    uint32_t dstIndex = 0;
+    f.resetFences(sw.device, 1, &sw.acqFence);
+    VkResult ar = f.acquireNextImage(sw.device, swapchain, 34000000ULL, VK_NULL_HANDLE, sw.acqFence, &dstIndex);
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+        if (g_config.debug) LOGW("vk: mc acquire rc=%d", (int)ar);
+        return false;
+    }
+    f.waitFences(sw.device, 1, &sw.acqFence, VK_TRUE, 50000000ULL);
+    if (dstIndex >= sw.images.size()) return false;
+
+    VkImage src = sw.images[srcIndex];
+    VkImage dst = sw.images[dstIndex];
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    auto imgBar = [&](VkImage img, VkImageLayout o, VkImageLayout n,
+                      VkAccessFlags sa, VkAccessFlags da,
+                      VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img; b.oldLayout = o; b.newLayout = n;
+        b.srcAccessMask = sa; b.dstAccessMask = da;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        f.barrier(sw.injCmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    VkImageCopy cp{};
+    cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {sw.extent.width, sw.extent.height, 1};
+
+    f.resetCmd(sw.injCmd, 0);
+    f.beginCmd(sw.injCmd, &bi);
+
+    // (1) Copy the freshly-rendered swapchain image (src) into gCur.
+    imgBar(src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+           VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imgBar(sw.gCur, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+           0, VK_ACCESS_TRANSFER_WRITE_BIT,
+           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    f.cmdCopyImage(sw.injCmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    imgBar(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+           VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    if (sw.mcHist == 0) {
+        // First frame: seed gPrev = gCur and present a duplicate of cur.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // gCur left in TRANSFER_SRC; next frame re-copies it from UNDEFINED.
+        sw.mcHist = 1;
+    } else {
+        // gCur -> GENERAL (compute reads). gPrev already GENERAL.
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        // gPrev2 -> GENERAL. Until the first history shift its contents are
+        // undefined (warp ignores it when useAccel == 0).
+        if (sw.mcHist < 2) {
+            imgBar(sw.gPrev2, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                   0, VK_ACCESS_SHADER_READ_BIT,
+                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
+        // gOut -> GENERAL (compute writes).
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        McPC pc{};
+        pc.width = (int)sw.extent.width; pc.height = (int)sw.extent.height;
+        pc.tilesX = sw.mcTilesX; pc.tilesY = sw.mcTilesY;
+        pc.tile = g_config.mc_tile > 0 ? g_config.mc_tile : 16;
+        pc.search = g_config.mc_search > 0 ? g_config.mc_search : 24;
+        pc.levels = g_config.mc_levels > 0 ? g_config.mc_levels : 4;
+        pc.useAccel = (sw.mcHist >= 2) ? 1 : 0;
+        pc.t = 0.5f;
+        pc.occl = g_config.mc_occl;
+
+        // Pass 1: motion estimation -> flow SSBO (one invocation per tile).
+        f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.mcFlowPipe);
+        f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.mcPipeLayout, 0, 1, &sw.mcDescSet, 0, nullptr);
+        f.cmdPushConst(sw.injCmd, sw.mcPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(McPC), &pc);
+        f.cmdDispatch(sw.injCmd, (uint32_t)((sw.mcTilesX + 7) / 8), (uint32_t)((sw.mcTilesY + 7) / 8), 1);
+
+        // Flow writes must be visible to the warp pass.
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        f.barrier(sw.injCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        // Pass 2: motion-compensated warp -> gOut (full resolution).
+        f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.mcWarpPipe);
+        f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.mcPipeLayout, 0, 1, &sw.mcDescSet, 0, nullptr);
+        f.cmdPushConst(sw.injCmd, sw.mcPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(McPC), &pc);
+        f.cmdDispatch(sw.injCmd, (sw.extent.width + 7) / 8, (sw.extent.height + 7) / 8, 1);
+
+        // gOut -> dst.
+        imgBar(sw.gOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        // History shift: gPrev -> gPrev2, then gCur -> gPrev (all start GENERAL).
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(sw.gPrev2, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sw.gPrev2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(sw.gPrev2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBar(sw.gCur, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        f.cmdCopyImage(sw.injCmd, sw.gCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        imgBar(sw.gPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        // gCur left in TRANSFER_SRC; next frame re-copies it from UNDEFINED.
+        if (sw.mcHist < 2) sw.mcHist = 2;
+    }
+
+    f.endCmd(sw.injCmd);
+
+    std::vector<VkPipelineStageFlags> waitStages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = info->waitSemaphoreCount;
+    si.pWaitSemaphores = info->pWaitSemaphores;
+    si.pWaitDstStageMask = info->waitSemaphoreCount ? waitStages.data() : nullptr;
+    si.commandBufferCount = 1; si.pCommandBuffers = &sw.injCmd;
+    f.resetFences(sw.device, 1, &sw.injFence);
+    if (f.submit(queue, 1, &si, sw.injFence) != VK_SUCCESS) { if (g_config.debug) LOGW("vk: mc submit fail"); return false; }
+    f.waitFences(sw.device, 1, &sw.injFence, VK_TRUE, 100000000ULL);
+
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &swapchain;
+    pi.pImageIndices = &dstIndex;
+    orig_QueuePresent(queue, &pi);
+
+    if (!sw.mcLogged) {
+        LOGI("vk: motion-compensated interpolation active src=%u dst=%u %ux%u tiles=%dx%d",
+             srcIndex, dstIndex, sw.extent.width, sw.extent.height, sw.mcTilesX, sw.mcTilesY);
+        sw.mcLogged = true;
+    }
+    return true;
+}
+
 bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR* info, uint32_t srcIndex) {
     std::lock_guard<std::mutex> lk(g_mtx);
     auto sit = g_swaps.find(swapchain);
@@ -712,6 +1109,67 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
     return r;
 }
 
+// Free all lazily-created GPU resources owned by a swapchain. Must be called
+// with g_mtx held. Waits for the device to go idle first so nothing in flight
+// still references the objects we destroy.
+static void freeSwapResources(SwapInfo& sw, DevFns& f) {
+    if (f.deviceWaitIdle) f.deviceWaitIdle(sw.device);
+    auto dFence = [&](VkFence& h){ if (h && f.destroyFence) f.destroyFence(sw.device, h, nullptr); h = VK_NULL_HANDLE; };
+    auto dBuf   = [&](VkBuffer& h){ if (h && f.destroyBuffer) f.destroyBuffer(sw.device, h, nullptr); h = VK_NULL_HANDLE; };
+    auto dMem   = [&](VkDeviceMemory& h){ if (h && f.freeMem) f.freeMem(sw.device, h, nullptr); h = VK_NULL_HANDLE; };
+    auto dImg   = [&](VkImage& h){ if (h && f.destroyImage) f.destroyImage(sw.device, h, nullptr); h = VK_NULL_HANDLE; };
+    auto dView  = [&](VkImageView& h){ if (h && f.destroyImageView) f.destroyImageView(sw.device, h, nullptr); h = VK_NULL_HANDLE; };
+    // capture buffer/memory
+    dBuf(sw.buffer); dMem(sw.memory); sw.mapped = nullptr; sw.capReady = false;
+    // CPU-blend host buffers
+    dBuf(sw.dlBuf); dBuf(sw.ulBuf); dMem(sw.dlMem); dMem(sw.ulMem);
+    sw.dlMapped = sw.ulMapped = nullptr; sw.blendReady = false; sw.hasPrev = false;
+    // GPU-blend images/views/pipeline
+    dView(sw.gPrevView); dView(sw.gCurView); dView(sw.gOutView);
+    dImg(sw.gPrev); dImg(sw.gCur); dImg(sw.gOut);
+    dMem(sw.gPrevMem); dMem(sw.gCurMem); dMem(sw.gOutMem);
+    if (sw.gPipe && f.destroyPipeline) f.destroyPipeline(sw.device, sw.gPipe, nullptr); sw.gPipe = VK_NULL_HANDLE;
+    if (sw.gPipeLayout && f.destroyPipeLayout) f.destroyPipeLayout(sw.device, sw.gPipeLayout, nullptr); sw.gPipeLayout = VK_NULL_HANDLE;
+    if (sw.gShader && f.destroyShaderModule) f.destroyShaderModule(sw.device, sw.gShader, nullptr); sw.gShader = VK_NULL_HANDLE;
+    if (sw.gDescPool && f.destroyDescPool) f.destroyDescPool(sw.device, sw.gDescPool, nullptr); sw.gDescPool = VK_NULL_HANDLE;
+    if (sw.gDescLayout && f.destroyDescSetLayout) f.destroyDescSetLayout(sw.device, sw.gDescLayout, nullptr); sw.gDescLayout = VK_NULL_HANDLE;
+    sw.gDescSet = VK_NULL_HANDLE; sw.gpuReady = false; sw.gHasPrev = false;
+    // Stage 2C: motion-compensated interpolation resources
+    dView(sw.gPrev2View); dImg(sw.gPrev2); dMem(sw.gPrev2Mem);
+    dBuf(sw.mcFlowBuf); dMem(sw.mcFlowMem);
+    if (sw.mcFlowPipe && f.destroyPipeline) f.destroyPipeline(sw.device, sw.mcFlowPipe, nullptr); sw.mcFlowPipe = VK_NULL_HANDLE;
+    if (sw.mcWarpPipe && f.destroyPipeline) f.destroyPipeline(sw.device, sw.mcWarpPipe, nullptr); sw.mcWarpPipe = VK_NULL_HANDLE;
+    if (sw.mcPipeLayout && f.destroyPipeLayout) f.destroyPipeLayout(sw.device, sw.mcPipeLayout, nullptr); sw.mcPipeLayout = VK_NULL_HANDLE;
+    if (sw.mcFlowShader && f.destroyShaderModule) f.destroyShaderModule(sw.device, sw.mcFlowShader, nullptr); sw.mcFlowShader = VK_NULL_HANDLE;
+    if (sw.mcWarpShader && f.destroyShaderModule) f.destroyShaderModule(sw.device, sw.mcWarpShader, nullptr); sw.mcWarpShader = VK_NULL_HANDLE;
+    if (sw.mcDescPool && f.destroyDescPool) f.destroyDescPool(sw.device, sw.mcDescPool, nullptr); sw.mcDescPool = VK_NULL_HANDLE;
+    if (sw.mcDescLayout && f.destroyDescSetLayout) f.destroyDescSetLayout(sw.device, sw.mcDescLayout, nullptr); sw.mcDescLayout = VK_NULL_HANDLE;
+    sw.mcDescSet = VK_NULL_HANDLE; sw.mcReady = false; sw.mcHist = 0; sw.mcLogged = false;
+    // fences
+    dFence(sw.fence); dFence(sw.injFence); dFence(sw.acqFence);
+    // command pool (also frees its command buffers)
+    if (sw.pool && f.destroyPool) f.destroyPool(sw.device, sw.pool, nullptr); sw.pool = VK_NULL_HANDLE;
+    sw.cmd = VK_NULL_HANDLE; sw.injCmd = VK_NULL_HANDLE;
+    sw.injReady = false; sw.engineConnected = false;
+}
+
+// Hook vkDestroySwapchainKHR so swapchain recreation (rotation, resolution
+// change, app foreground/background) doesn't leak our per-swapchain GPU
+// resources or leave stale VkImage handles in g_swaps.
+void my_DestroySwapchain(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* alloc) {
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_swaps.find(swapchain);
+        if (it != g_swaps.end()) {
+            DevFns& f = devFns(device);
+            freeSwapResources(it->second, f);
+            g_swaps.erase(it);
+            LOGI("vk: swapchain %p destroyed, resources freed", (void*)swapchain);
+        }
+    }
+    if (orig_DestroySwapchain) orig_DestroySwapchain(device, swapchain, alloc);
+}
+
 VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
     // STAGE 2 one-shot interop benchmark (opt-in via cleanfg.prop interop_bench=1).
     if (info && info->swapchainCount >= 1 && g_config.interop_bench) {
@@ -797,7 +1255,11 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
         // (CPU blend of the previous and current frame) and present it BEFORE
         // the real current frame, for genuinely smoother perceived motion.
         if (g_config.present_bridge && info->swapchainCount == 1) {
-            bool consumed = injectBlend(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
+            // Prefer real motion-compensated interpolation when enabled; fall
+            // back to the adaptive blend only if MC setup hard-fails.
+            bool consumed = false;
+            if (g_config.mc_interp) consumed = injectMcInterp(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
+            if (!consumed) consumed = injectBlend(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
             if (consumed) {
                 VkPresentInfoKHR real = *info;
                 real.waitSemaphoreCount = 0;
@@ -896,6 +1358,10 @@ PFN_vkVoidFunction VKAPI_PTR my_GetDeviceProcAddr(VkDevice dev, const char* name
         LOGI("vk: intercepted vkCreateSwapchainKHR via gdpa");
         return (PFN_vkVoidFunction)my_CreateSwapchain;
     }
+    if (!strcmp(name, "vkDestroySwapchainKHR")) {
+        orig_DestroySwapchain = (PFN_vkDestroySwapchainKHR)real;
+        return (PFN_vkVoidFunction)my_DestroySwapchain;
+    }
     return real;
 }
 
@@ -919,6 +1385,10 @@ PFN_vkVoidFunction VKAPI_PTR my_GetInstanceProcAddr(VkInstance inst, const char*
     if (!strcmp(name, "vkCreateSwapchainKHR")) {
         orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)real;
         return (PFN_vkVoidFunction)my_CreateSwapchain;
+    }
+    if (!strcmp(name, "vkDestroySwapchainKHR")) {
+        orig_DestroySwapchain = (PFN_vkDestroySwapchainKHR)real;
+        return (PFN_vkVoidFunction)my_DestroySwapchain;
     }
     if (!strcmp(name, "vkQueuePresentKHR")) {
         orig_QueuePresent = (PFN_vkQueuePresentKHR)real;
@@ -955,11 +1425,13 @@ bool installVulkanHook() {
     // calls them directly. Harmless if never invoked.
     void* createDev  = dlsym(libvk, "vkCreateDevice");
     void* createSwap = dlsym(libvk, "vkCreateSwapchainKHR");
+    void* destroySwap = dlsym(libvk, "vkDestroySwapchainKHR");
     void* present    = dlsym(libvk, "vkQueuePresentKHR");
     void* createAndroidSurf = dlsym(libvk, "vkCreateAndroidSurfaceKHR");
     if (createAndroidSurf) { void* t = hookFunction(createAndroidSurf, (void*)my_CreateAndroidSurface); if (t && !orig_CreateAndroidSurface) orig_CreateAndroidSurface = (PFN_vkCreateAndroidSurfaceKHR)t; }
     if (createDev)  { void* t = hookFunction(createDev,  (void*)my_CreateDevice);    if (t && !orig_CreateDevice)    orig_CreateDevice    = (PFN_vkCreateDevice)t; }
     if (createSwap) { void* t = hookFunction(createSwap, (void*)my_CreateSwapchain); if (t && !orig_CreateSwapchain) orig_CreateSwapchain = (PFN_vkCreateSwapchainKHR)t; }
+    if (destroySwap){ void* t = hookFunction(destroySwap,(void*)my_DestroySwapchain); if (t && !orig_DestroySwapchain) orig_DestroySwapchain = (PFN_vkDestroySwapchainKHR)t; }
     if (present)    { void* t = hookFunction(present,    (void*)my_QueuePresent);    if (t && !orig_QueuePresent)    orig_QueuePresent    = (PFN_vkQueuePresentKHR)t; }
 
     if (any) LOGI("vk: proc-addr interception installed (gipa=%p gdpa=%p)", gipa, gdpa);

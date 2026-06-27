@@ -56,6 +56,10 @@ jobs:
           sudo apt-get install -y glslang-tools
           glslangValidator -V jni/blend.comp --vn blend_comp_spv -o jni/blend_comp.h
           head -8 jni/blend_comp.h
+          glslangValidator -V jni/mc_flow.comp --vn mc_flow_comp_spv -o jni/mc_flow_comp.h
+          head -8 jni/mc_flow_comp.h
+          glslangValidator -V jni/mc_warp.comp --vn mc_warp_comp_spv -o jni/mc_warp_comp.h
+          head -8 jni/mc_warp_comp.h
 
       - name: Build native module for each ABI
         run: |

@@ -12,15 +12,45 @@ target_packages=com.miHoYo.GenshinImpact
 
 # mode: auto | gles | vulkan
 #   auto = install BOTH hooks and let the module auto-detect which display
-#          technique each app actually uses (the first present call wins; the
-#          other path stays a pass-through). Use this for a mixed app list.
+#          technique each app actually uses. Vulkan has priority: the GLES path
+#          waits out a short warm-up window (see warmup_frames) so a game that
+#          shows a brief GLES splash before switching to Vulkan still ends up on
+#          the better Vulkan present path. Whichever engine wins, the other path
+#          stays a pass-through. Use this for a mixed app list.
 mode=auto
+
+# warmup_frames: auto mode only. How many real frames of the main GLES surface
+#   to let pass before the GLES path is allowed to claim the engine. Larger =
+#   more time for a Vulkan swapchain to appear and win; smaller = GLES frame-gen
+#   starts sooner in GLES-only apps. Default 120 (~2s at 60fps). Ignored in
+#   mode=gles / mode=vulkan.
+warmup_frames=120
 
 multiplier=2
 max_fps=0
 elevate_rate=1
 force_swap_interval_0=1
 present_bridge=1
+
+# --- Motion-compensated interpolation (real frame generation) ---
+# mc_interp: 1 = generate the in-between frame by estimating real motion vectors
+#   and warping the picture along them (sharp, genuinely smoother motion).
+#   0 = use the simple adaptive blend instead. Requires present_bridge=1 and the
+#   Vulkan path. This is the "do it properly" mode; costs more GPU than the blend.
+mc_interp=1
+# mc_tile: motion-field tile size in px. Smaller = finer motion detail but more
+#   GPU. 16 is a good balance; try 8 for more detail, 24/32 to save GPU.
+mc_tile=16
+# mc_search: max motion magnitude searched, in px. Raise for very fast motion
+#   (fast camera spins), lower to save GPU. 24 is a sane default.
+mc_search=24
+# mc_levels: coarse-to-fine search steps. 4 covers large motion cheaply; 5-6 for
+#   extreme motion, 3 to save a little GPU.
+mc_levels=4
+# mc_occl: occlusion sensitivity (0..1). Luma difference above which the motion
+#   vector is distrusted and the frame falls back near edges/occlusions. Lower =
+#   more aggressive fallback (fewer artifacts, slightly less smooth). 0.20 default.
+mc_occl=0.20
 method=blend
 debug=1
 blend_alpha=0.5
