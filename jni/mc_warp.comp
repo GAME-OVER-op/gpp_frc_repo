@@ -29,6 +29,10 @@ vec4 nnCur(vec2 p) {
     p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
     return imageLoad(curImg, ivec2(p + 0.5));
 }
+vec4 nnPrev2(vec2 p) {
+    p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
+    return imageLoad(prev2Img, ivec2(p + 0.5));
+}
 
 vec4 biPrev(vec2 p) {
     p = clamp(p, vec2(0.0), vec2(pc.width - 1, pc.height - 1));
@@ -117,8 +121,10 @@ void main() {
         if (pc.useAccel != 0) {
             // Extrapolate one more step back along the same motion and compare
             // prev with prev2: a side consistent with its own history is the
-            // real (occluded) content -> trust it.
-            vec4 p2 = biPrev2(pPos - mv);
+            // real (occluded) content -> trust it. Nearest fetch (1 read vs 4):
+            // this branch fires on every luma edge, so it dominates cost in
+            // busy scenes -- the stability check tolerates nearest sampling.
+            vec4 p2 = nnPrev2(pPos - mv);
             float stab = abs(luma(pv) - luma(p2));
             trustPrev = 1.0 - clamp(stab / max(pc.occl, 1e-3), 0.0, 1.0);
         }
@@ -135,11 +141,12 @@ void main() {
     vec4  vw = (pv * pw + cv * cw) / (pw + cw);
 
     // Blend from the interior MC result toward the validity result near borders.
-    // Capped below 1.0 so the edge band always keeps a little of the temporally
-    // continuous MC result: this removes the stepped judder a full hand-off
-    // caused, while still strongly suppressing the old edge smear.
-    const float EDGE_MAX = 0.8;
-    float border = (1.0 - min(wp, wc)) * EDGE_MAX;
+    // Fast-motion edges (racing periphery / radial expansion) disocclude hard,
+    // so a strong hand-off there steps badly. Scale the hand-off DOWN as motion
+    // grows: slow edges stay sharp (0.8), fast edges keep more temporally
+    // continuous MC (0.5) to kill the stepped judder.
+    float edgeMax = mix(0.8, 0.5, clamp(length(mv) / 32.0, 0.0, 1.0));
+    float border = (1.0 - min(wp, wc)) * edgeMax;
     vec4 res = mix(mc, vw, border);
     imageStore(outImg, p, res);
 }
