@@ -101,6 +101,8 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "mc_occl") {
             g_config.mc_occl = (float)atof(val.c_str());
             if (g_config.mc_occl < 0.001f) g_config.mc_occl = 0.001f;
+        } else if (key == "mc_bilinear") {
+            g_config.mc_bilinear = (val == "1" || val == "true") ? 1 : 0;
         } else if (key == "method") {
             g_config.method = (val == "extrapolate" || val == "reproject") ? Method::Extrapolate : Method::Blend;
         } else if (key == "max_fps") {
@@ -147,6 +149,7 @@ static void parseConfigText(const std::string& content) {
     LOGI("mc params: interp=%d tile=%d search=%d levels=%d occl=%.3f",
          g_config.mc_interp, g_config.mc_tile, g_config.mc_search,
          g_config.mc_levels, g_config.mc_occl);
+    LOGI("mc perf: bilinear=%d", g_config.mc_bilinear);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
     LOGI("extrap_eval=%d", g_config.extrap_eval);
 }

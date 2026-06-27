@@ -37,10 +37,11 @@ struct Config {
     int blur_radius = 0;            // 0 = off; box-blur radius in motion zones
     // --- Stage 2C: motion-compensated interpolation (real frame generation) ---
     bool mc_interp = false;   // enable motion-compensated interpolation (needs present_bridge=1, Vulkan path)
-    int  mc_tile = 16;        // flow tile size in px (smaller = finer motion, more GPU)
-    int  mc_search = 24;      // max motion search radius in px
-    int  mc_levels = 4;       // coarse-to-fine search steps
+    int  mc_tile = 24;        // flow tile size in px (smaller = finer motion, more GPU)
+    int  mc_search = 16;      // max motion search radius in px
+    int  mc_levels = 3;       // coarse-to-fine search steps
     float mc_occl = 0.20f;    // occlusion sensitivity: luma-diff above which the vector is distrusted
+    int  mc_bilinear = 0;     // 1 = bilinear warp (smoother, ~3x more reads), 0 = nearest (faster)
     bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
     bool extrap_bench = false;      // Stage 2: run one-shot glExtrapolateTex2DQCOM probe
     bool extrap_eval = false;       // Stage 2: objective ME prediction eval (logcat only)

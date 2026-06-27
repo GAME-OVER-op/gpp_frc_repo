@@ -576,6 +576,7 @@ bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
 struct McPC {
     int32_t width, height, tilesX, tilesY;
     int32_t tile, search, levels, useAccel;
+    int32_t bilinear;   // 1 = bilinear warp sampling (smoother, costlier), 0 = nearest (faster)
     float t, occl;
 };
 
@@ -830,10 +831,11 @@ bool injectMcInterp(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfo
         McPC pc{};
         pc.width = (int)sw.extent.width; pc.height = (int)sw.extent.height;
         pc.tilesX = sw.mcTilesX; pc.tilesY = sw.mcTilesY;
-        pc.tile = g_config.mc_tile > 0 ? g_config.mc_tile : 16;
-        pc.search = g_config.mc_search > 0 ? g_config.mc_search : 24;
-        pc.levels = g_config.mc_levels > 0 ? g_config.mc_levels : 4;
+        pc.tile = g_config.mc_tile > 0 ? g_config.mc_tile : 24;
+        pc.search = g_config.mc_search > 0 ? g_config.mc_search : 16;
+        pc.levels = g_config.mc_levels > 0 ? g_config.mc_levels : 3;
         pc.useAccel = (sw.mcHist >= 2) ? 1 : 0;
+        pc.bilinear = g_config.mc_bilinear ? 1 : 0;
         pc.t = 0.5f;
         pc.occl = g_config.mc_occl;
 

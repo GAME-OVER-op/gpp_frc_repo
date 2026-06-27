@@ -39,18 +39,34 @@ present_bridge=1
 #   Vulkan path. This is the "do it properly" mode; costs more GPU than the blend.
 mc_interp=1
 # mc_tile: motion-field tile size in px. Smaller = finer motion detail but more
-#   GPU. 16 is a good balance; try 8 for more detail, 24/32 to save GPU.
-mc_tile=16
+#   GPU (fewer tiles when larger). 24 is the perf default; 16 for more detail,
+#   32/48 to save GPU on weaker devices.
+mc_tile=24
 # mc_search: max motion magnitude searched, in px. Raise for very fast motion
-#   (fast camera spins), lower to save GPU. 24 is a sane default.
-mc_search=24
-# mc_levels: coarse-to-fine search steps. 4 covers large motion cheaply; 5-6 for
-#   extreme motion, 3 to save a little GPU.
-mc_levels=4
+#   (fast camera spins), lower to save GPU. 16 is the perf default.
+mc_search=16
+# mc_levels: coarse-to-fine search steps. 3 is the perf default; 4-5 for extreme
+#   motion, 2 to save more GPU.
+mc_levels=3
 # mc_occl: occlusion sensitivity (0..1). Luma difference above which the motion
 #   vector is distrusted and the frame falls back near edges/occlusions. Lower =
 #   more aggressive fallback (fewer artifacts, slightly less smooth). 0.20 default.
 mc_occl=0.20
+# mc_bilinear: 1 = bilinear warp sampling (smoother edges, ~3x more GPU reads in
+#   the warp pass). 0 = nearest sampling (much faster, default). Turn on only if
+#   you have GPU headroom to spare.
+mc_bilinear=0
+#
+# ---- Performance tuning (if FPS drops too much) ----
+# Motion-compensated interpolation is real per-pixel GPU work every frame, so on
+# a GPU-bound device it WILL cost frametime. If your FPS falls (e.g. 120 -> 50):
+#   1) Keep mc_bilinear=0 (nearest warp).
+#   2) Raise mc_tile: 24 -> 32 -> 48 (biggest, cheapest win).
+#   3) Lower mc_search: 16 -> 10, and mc_levels: 3 -> 2.
+#   4) If the GAME already hits your screen's max refresh on its own, you don't
+#      need interpolation at all there - it only helps when the game runs BELOW
+#      the display's refresh rate. Set mc_interp=0 for titles that already max out.
+# Ultra-light preset:  mc_tile=48  mc_search=10  mc_levels=2  mc_bilinear=0
 method=blend
 debug=1
 blend_alpha=0.5
