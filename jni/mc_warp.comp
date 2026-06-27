@@ -95,11 +95,12 @@ void main() {
     vec2 pPos = x - t * mv;
     vec2 cPos = x + (1.0 - t) * mv;
 
-    // Soft validity of each tap. The ramp width scales with motion so fast
-    // edges get a wider, seam-free hand-off instead of a hard line.
-    float margin = clamp(length(mv) * 0.5, 2.0, 24.0);
-    float wp = edgeWeight(pPos, margin);
-    float wc = edgeWeight(cPos, margin);
+    // Soft validity of each tap. Smoothstepped + motion-scaled ramp so the
+    // hand-off has no hard line, and a moderate cap keeps the affected edge
+    // band narrow during fast rotation.
+    float margin = clamp(length(mv) * 0.5, 2.0, 16.0);
+    float wp = smoothstep(0.0, 1.0, edgeWeight(pPos, margin));
+    float wc = smoothstep(0.0, 1.0, edgeWeight(cPos, margin));
 
     // Bilinear is smoother but 4 reads/fetch; nearest is the perf default.
     vec4 pv = (pc.bilinear != 0) ? biPrev(pPos) : nnPrev(pPos);
@@ -125,25 +126,20 @@ void main() {
         mc = mix(mix(pv, cv, t), chosen, occ);
     }
 
-    // Border / disocclusion correction: weight each tap by its temporal share
-    // (1-t for prev, t for cur) AND its validity, then renormalise. Where one
-    // side is off-frame (newly revealed content), this smoothly hands over to
-    // the side that actually has the pixels, killing the edge smear/ghosting.
-    float pw  = (1.0 - t) * wp;
-    float cw  = t * wc;
-    float sum = pw + cw;
+    // Border / disocclusion correction. Weight each tap by its temporal share
+    // (1-t for prev, t for cur) AND its validity, then renormalise. A small
+    // constant cur bias means degenerate corners resolve to the real current
+    // frame smoothly (no hard snap -> no edge flicker).
+    float pw = (1.0 - t) * wp;
+    float cw = t * wc + 1e-3;
+    vec4  vw = (pv * pw + cv * cw) / (pw + cw);
 
-    vec4 res;
-    if (sum < 1e-4) {
-        // Both taps off-frame: fall back to the true current pixel (identity)
-        // so freshly revealed edges show real content, not a smear.
-        res = (pc.bilinear != 0) ? biCur(x) : nnCur(x);
-    } else {
-        vec4 vw = (pv * pw + cv * cw) / sum;
-        // Apply the validity blend only near a border (asymmetric validity);
-        // the interior (wp == wc == 1) keeps the full occlusion-aware result.
-        float border = 1.0 - min(wp, wc);
-        res = mix(mc, vw, border);
-    }
+    // Blend from the interior MC result toward the validity result near borders.
+    // Capped below 1.0 so the edge band always keeps a little of the temporally
+    // continuous MC result: this removes the stepped judder a full hand-off
+    // caused, while still strongly suppressing the old edge smear.
+    const float EDGE_MAX = 0.8;
+    float border = (1.0 - min(wp, wc)) * EDGE_MAX;
+    vec4 res = mix(mc, vw, border);
     imageStore(outImg, p, res);
 }
