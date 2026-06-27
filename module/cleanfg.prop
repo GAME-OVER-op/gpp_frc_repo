@@ -1,5 +1,21 @@
+# cleanfg config -- read once at app start, no network.
+#
+# target_packages: comma-separated list of apps the module activates in.
+#   - Exact name:        com.miHoYo.GenshinImpact
+#   - Wildcard family:   com.miHoYo.*        (* = any run, ? = one char)
+#   - Suffix/substring:  *.mpv  ,  *vlc*
+#   - Everything (global, not recommended): *   (or: all)
+#   Add as many games AND video apps as you like, mixing exact names + globs.
+#   Examples (uncomment / edit):
+#     target_packages=com.miHoYo.GenshinImpact,com.miHoYo.*,org.videolan.vlc,is.xyz.mpv
 target_packages=com.miHoYo.GenshinImpact
-mode=vulkan
+
+# mode: auto | gles | vulkan
+#   auto = install BOTH hooks and let the module auto-detect which display
+#          technique each app actually uses (the first present call wins; the
+#          other path stays a pass-through). Use this for a mixed app list.
+mode=auto
+
 multiplier=2
 max_fps=0
 elevate_rate=1

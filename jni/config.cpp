@@ -9,6 +9,23 @@
 namespace cleanfg {
 
 Config g_config;
+std::atomic<int> g_activeEngine{0};
+
+// Glob matcher supporting '*' (any run of chars) and '?' (any single char).
+// Case-sensitive, matches the whole string. Lets the config target families of
+// apps, e.g. "com.miHoYo.*", "org.videolan.*", "*.mpv".
+static bool globMatch(const char* pat, const char* str) {
+    const char* star = nullptr;
+    const char* ss = str;
+    while (*str) {
+        if (*pat == '?' || *pat == *str) { ++pat; ++str; }
+        else if (*pat == '*') { star = pat++; ss = str; }
+        else if (star) { pat = star + 1; str = ++ss; }
+        else return false;
+    }
+    while (*pat == '*') ++pat;
+    return *pat == '\0';
+}
 
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -22,7 +39,13 @@ bool Config::matchesPackage(const char* name) const {
     if (target_packages.empty()) return false;  // ничего не хукаем по умолчанию
     for (const auto& p : target_packages) {
         if (p == "*" || p == "all") return true;
-        if (p == name) return true;
+        // Pattern entries (contain '*' or '?') are glob-matched; everything else
+        // is an exact package-name match (unchanged behaviour for plain names).
+        if (p.find('*') != std::string::npos || p.find('?') != std::string::npos) {
+            if (globMatch(p.c_str(), name)) return true;
+        } else if (p == name) {
+            return true;
+        }
     }
     return false;
 }

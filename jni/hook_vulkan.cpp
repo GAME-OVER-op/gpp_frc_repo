@@ -288,8 +288,11 @@ void captureAndSubmit(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageInd
     }
 
     if (!sw.engineConnected) {
-        std::string pkg = g_config.target_packages.empty() ? std::string("com.miHoYo.GenshinImpact")
-                                                            : g_config.target_packages.front();
+        // Use the package of THIS process (set at match time). Falls back to the
+        // first configured target, then to a sane default, for safety.
+        std::string pkg = !g_config.current_package.empty() ? g_config.current_package
+                          : (g_config.target_packages.empty() ? std::string("com.miHoYo.GenshinImpact")
+                                                              : g_config.target_packages.front());
         std::string layer = "SurfaceView[" + pkg + "]#0";
         sw.engineConnected = g_engine.connect(pkg, layer, (int)sw.extent.width, (int)sw.extent.height);
     }
@@ -782,6 +785,12 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
             }
             return orig_QueuePresent(queue, info);
         }
+    }
+    // Auto-detect: claim the Vulkan engine for this process. If the GLES path
+    // already claimed it, the app renders with GLES -> present normally.
+    if (g_config.mode == Mode::Auto) {
+        int expected = 0; g_activeEngine.compare_exchange_strong(expected, 2);
+        if (g_activeEngine.load() != 2) return orig_QueuePresent(queue, info);
     }
     if (info) {
         // STAGE 2A present-bridge: synthesize an interpolated midpoint frame

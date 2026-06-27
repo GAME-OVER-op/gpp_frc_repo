@@ -32,6 +32,12 @@ static EGLBoolean my_eglSwapInterval(EGLDisplay d,EGLint interval){
 }
 static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
     if(g_inside) return orig_eglSwapBuffers(dpy,surface);
+    // Auto-detect: claim the GLES engine for this process. If the Vulkan path
+    // already claimed it, the app renders with Vulkan -> stay a pass-through.
+    if(g_config.mode==Mode::Auto){
+        int expected=0; g_activeEngine.compare_exchange_strong(expected,1);
+        if(g_activeEngine.load()!=1) return orig_eglSwapBuffers(dpy,surface);
+    }
     g_inside=true;
     if(!g_inited){ EGLint w=0,h=0; eglQuerySurface(dpy,surface,EGL_WIDTH,&w); eglQuerySurface(dpy,surface,EGL_HEIGHT,&h); g_ctx.width=w; g_ctx.height=h; fgInitGles(w,h); g_inited=true; }
     fgCaptureCurrentGles(g_ctx);

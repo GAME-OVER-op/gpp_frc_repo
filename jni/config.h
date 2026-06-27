@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <atomic>
 
 namespace cleanfg {
 
@@ -9,6 +10,11 @@ enum class Method { Blend, Extrapolate };
 
 struct Config {
     std::vector<std::string> target_packages;
+    // The actual package name of the current process, set once it is matched in
+    // preAppSpecialize. With a multi-app target list we must remember WHICH app
+    // we are running inside (the vendor engine connects per package), instead of
+    // assuming the first entry of target_packages.
+    std::string current_package;
     Mode mode = Mode::Auto;
     Method method = Method::Blend;
     int multiplier = 2;
@@ -30,6 +36,13 @@ struct Config {
 };
 
 extern Config g_config;
+
+// Auto engine arbitration. In Mode::Auto both the EGL and Vulkan present hooks
+// are installed; the first present path that actually fires in this process
+// "claims" the engine so the other path stays a pass-through. This is how the
+// module auto-detects the display technique (GLES vs Vulkan) per app.
+//   0 = undecided, 1 = GLES/EGL, 2 = Vulkan
+extern std::atomic<int> g_activeEngine;
 // Direct file read (root context only, e.g. companion). Fails from app processes
 // because /data/adb is not accessible to unprivileged UIDs.
 bool loadConfig(const char* path);
