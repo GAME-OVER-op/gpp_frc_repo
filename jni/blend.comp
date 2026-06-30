@@ -1,12 +1,13 @@
 #version 450
-// cleanfg GPU adaptive frame-blend.
+// cleanfg GPU frame interpolation.
 // All three images are storage images in VK_FORMAT_R8G8B8A8_UNORM (rgba8). The
-// blend is channel-order agnostic (correct for RGBA or BGRA alike).
+// math is channel-order agnostic (correct for RGBA or BGRA alike).
 //
-// Difference-adaptive alpha: on a static scene we blend 50/50 for maximum
-// smoothness; where the frame changes a lot (fast camera turn / sliding) the
-// blend smoothly biases toward the newest real frame (cur) so the doubled
-// ghost fades instead of snapping -- a smoothstep mask, NOT a hard cut.
+// method=0: existing difference-adaptive blend fallback.
+// method=1: lightweight screen-space optical-flow interpolation. It estimates a
+// local backward vector (current -> previous) with luma block matching, then
+// samples prev/cur halfway along that vector. Bad matches fall back smoothly to
+// the current real frame to avoid tearing / hard ghost doubles.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8) uniform readonly  image2D prevImg;
 layout(set = 0, binding = 1, rgba8) uniform readonly  image2D curImg;
@@ -17,32 +18,129 @@ layout(push_constant) uniform Params {
     float diffSoftness;    // smoothstep width above threshold
     float motionStrength;  // 0..1 how aggressively motion kills the blend
     int   blurRadius;      // 0 = off; >0 = box blur radius in high-motion zones
+    int   method;          // 0=adaptive blend, 1=screen-space flow
+    int   searchRadius;    // optical-flow search radius in pixels
+    int   patchRadius;     // 0..3, SAD patch radius
+    float confidenceScale; // higher rejects bad motion matches faster
 } pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+ivec2 clampPx(ivec2 p, ivec2 sz) {
+    return clamp(p, ivec2(0), sz - ivec2(1));
+}
+
+vec4 loadPrev(ivec2 p, ivec2 sz) { return imageLoad(prevImg, clampPx(p, sz)); }
+vec4 loadCur(ivec2 p, ivec2 sz)  { return imageLoad(curImg,  clampPx(p, sz)); }
+
+vec4 samplePrevBilinear(vec2 p, ivec2 sz) {
+    vec2 q = clamp(p, vec2(0.0), vec2(sz - ivec2(1)));
+    ivec2 p0 = ivec2(floor(q));
+    ivec2 p1 = min(p0 + ivec2(1), sz - ivec2(1));
+    vec2 f = fract(q);
+    vec4 c00 = imageLoad(prevImg, p0);
+    vec4 c10 = imageLoad(prevImg, ivec2(p1.x, p0.y));
+    vec4 c01 = imageLoad(prevImg, ivec2(p0.x, p1.y));
+    vec4 c11 = imageLoad(prevImg, p1);
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+vec4 sampleCurBilinear(vec2 p, ivec2 sz) {
+    vec2 q = clamp(p, vec2(0.0), vec2(sz - ivec2(1)));
+    ivec2 p0 = ivec2(floor(q));
+    ivec2 p1 = min(p0 + ivec2(1), sz - ivec2(1));
+    vec2 f = fract(q);
+    vec4 c00 = imageLoad(curImg, p0);
+    vec4 c10 = imageLoad(curImg, ivec2(p1.x, p0.y));
+    vec4 c01 = imageLoad(curImg, ivec2(p0.x, p1.y));
+    vec4 c11 = imageLoad(curImg, p1);
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+float patchSad(ivec2 p, ivec2 d, ivec2 sz) {
+    float sad = 0.0;
+    float n = 0.0;
+    int pr = clamp(pc.patchRadius, 0, 3);
+    // Static loop bounds keep mobile compilers happy; runtime condition selects
+    // the actual radius.
+    for (int y = -3; y <= 3; ++y)
+    for (int x = -3; x <= 3; ++x) {
+        if (abs(x) > pr || abs(y) > pr) continue;
+        ivec2 o = ivec2(x, y);
+        float lc = luma(loadCur(p + o, sz).rgb);
+        float lp = luma(loadPrev(p + o + d, sz).rgb);
+        sad += abs(lc - lp);
+        n += 1.0;
+    }
+    return sad / max(n, 1.0);
+}
+
+vec4 renderAdaptiveBlend(ivec2 p, ivec2 sz) {
+    vec4 a = imageLoad(prevImg, p);
+    vec4 b = imageLoad(curImg, p);
+    float dl = abs(luma(b.rgb - a.rgb));
+    float hi = pc.diffThreshold + max(pc.diffSoftness, 1e-4);
+    float m  = smoothstep(pc.diffThreshold, hi, dl) * clamp(pc.motionStrength, 0.0, 1.0);
+    float alpha = mix(pc.baseAlpha, 1.0, m);
+    vec4 outc = mix(a, b, alpha);
+    if (pc.blurRadius > 0 && m > 0.001) {
+        vec4 acc = vec4(0.0); float wsum = 0.0;
+        int r = min(pc.blurRadius, 4);
+        for (int dy = -4; dy <= 4; ++dy)
+        for (int dx = -4; dx <= 4; ++dx) {
+            if (abs(dx) > r || abs(dy) > r) continue;
+            ivec2 q = clampPx(p + ivec2(dx, dy), sz);
+            acc += mix(imageLoad(prevImg, q), imageLoad(curImg, q), alpha);
+            wsum += 1.0;
+        }
+        outc = mix(outc, acc / max(wsum, 1.0), m);
+    }
+    return outc;
+}
+
+vec4 renderFlow(ivec2 p, ivec2 sz) {
+    // Search a local backward vector d: cur(p) ~= prev(p + d).
+    int sr = clamp(pc.searchRadius, 0, 12);
+    float best = 1e9;
+    float second = 1e9;
+    ivec2 bestD = ivec2(0);
+    for (int y = -12; y <= 12; ++y)
+    for (int x = -12; x <= 12; ++x) {
+        if (abs(x) > sr || abs(y) > sr) continue;
+        ivec2 d = ivec2(x, y);
+        float e = patchSad(p, d, sz);
+        // Prefer smaller vectors on ties to reduce random shimmer on flat areas.
+        e += 0.00035 * length(vec2(d));
+        if (e < best) { second = best; best = e; bestD = d; }
+        else if (e < second) { second = e; }
+    }
+
+    vec2 v = vec2(bestD);
+    vec4 fromPrev = samplePrevBilinear(vec2(p) + 0.5 * v, sz);
+    vec4 fromCur  = sampleCurBilinear(vec2(p) - 0.5 * v, sz);
+    vec4 warped = mix(fromPrev, fromCur, 0.5);
+    vec4 cur = imageLoad(curImg, p);
+
+    // Confidence combines match quality, ambiguity, and post-warp disagreement.
+    float matchConf = clamp(1.0 - best * pc.confidenceScale, 0.0, 1.0);
+    float distinct = clamp((second - best) * pc.confidenceScale * 4.0, 0.0, 1.0);
+    float warpErr = abs(luma(fromCur.rgb - fromPrev.rgb));
+    float warpConf = clamp(1.0 - warpErr * pc.confidenceScale, 0.0, 1.0);
+    float conf = matchConf * mix(0.55, 1.0, distinct) * warpConf;
+
+    // Fast camera/object motion: keep some motion-compensated result, but bias
+    // toward the real current frame where confidence is low. This removes hard
+    // torn silhouettes instead of presenting a bad hallucinated vector.
+    float mag = length(v);
+    float largeMotionPenalty = smoothstep(float(sr) * 0.55, float(sr), mag) * 0.35;
+    conf *= (1.0 - largeMotionPenalty);
+    return mix(cur, warped, conf);
+}
+
 void main() {
     ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(curImg);
     if (p.x >= sz.x || p.y >= sz.y) return;
-    vec4 a = imageLoad(prevImg, p);
-    vec4 b = imageLoad(curImg, p);
-    // Motion metric: absolute luma difference between the two real frames.
-    float dl = abs(dot(b.rgb - a.rgb, vec3(0.299, 0.587, 0.114)));
-    float hi = pc.diffThreshold + max(pc.diffSoftness, 1e-4);
-    float m  = smoothstep(pc.diffThreshold, hi, dl) * clamp(pc.motionStrength, 0.0, 1.0);
-    // Static -> baseAlpha; fast motion -> toward 1.0 (show cur, kill ghosting).
-    float alpha = mix(pc.baseAlpha, 1.0, m);
-    vec4 outc = mix(a, b, alpha);
-    // Optional: soften residual ghosting in high-motion zones with a box blur
-    // of the blended result (cinematic motion-blur look instead of doubling).
-    if (pc.blurRadius > 0 && m > 0.001) {
-        vec4 acc = vec4(0.0); float wsum = 0.0;
-        int r = pc.blurRadius;
-        for (int dy = -r; dy <= r; ++dy)
-        for (int dx = -r; dx <= r; ++dx) {
-            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), sz - ivec2(1));
-            acc += mix(imageLoad(prevImg, q), imageLoad(curImg, q), alpha);
-            wsum += 1.0;
-        }
-        outc = mix(outc, acc / wsum, m);
-    }
+    vec4 outc = (pc.method == 1) ? renderFlow(p, sz) : renderAdaptiveBlend(p, sz);
     imageStore(outImg, p, outc);
 }

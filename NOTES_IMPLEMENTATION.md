@@ -36,6 +36,42 @@ method=blend
 debug=0
 ```
 
+## Stage 3: screen-space optical-flow interpolation
+
+Добавлен первый вариант вычислительной логики генерации кадров для Vulkan
+present-bridge: `method=flow`.
+
+В отличие от старого `method=blend`, новый путь не просто смешивает два кадра.
+Compute shader в `jni/blend.comp` теперь умеет локально оценивать движение по
+яркости между `prev` и `cur` кадрами:
+
+1. Для каждого пикселя ищется лучший локальный offset `current -> previous` по
+   SAD/MAD яркости на маленьком patch'е.
+2. По найденному вектору shader берёт выборки из предыдущего и текущего кадра на
+   половине смещения.
+3. Рассчитывается confidence по качеству матча, неоднозначности второго лучшего
+   вектора и ошибке после warp.
+4. Если confidence низкий, результат мягко уходит к текущему реальному кадру —
+   это важнее, чем агрессивно рисовать неверный вектор и получать рваные края.
+
+Новые параметры `cleanfg.prop`:
+
+```ini
+method=flow
+flow_search_radius=4
+flow_patch_radius=1
+flow_confidence_scale=6.0
+```
+
+Режим `method=blend` оставлен как fallback: тот же shader переключается через
+push constants, поэтому можно откатываться конфигом без изменения кода.
+
+Это ещё не полноценный FSR/optical-flow pipeline с пирамидами, depth и
+forward/backward consistency, но это первый шаг от blend к motion-compensated
+interpolation. Следующий качественный этап — вынести оценку motion vectors в
+отдельные pass'ы с low-res pyramid, confidence/disocclusion mask и temporal
+stability.
+
 `max_fps=0` значит: просить `measured_fps * multiplier`, а Android сам зажмёт до доступного режима панели. Если хочешь жёстко ограничить — поставь `max_fps=120` или `144`.
 
 ## Загрузка движка GPP через собственный linker-namespace (фикс)

@@ -9,23 +9,6 @@
 namespace cleanfg {
 
 Config g_config;
-std::atomic<int> g_activeEngine{0};
-
-// Glob matcher supporting '*' (any run of chars) and '?' (any single char).
-// Case-sensitive, matches the whole string. Lets the config target families of
-// apps, e.g. "com.miHoYo.*", "org.videolan.*", "*.mpv".
-static bool globMatch(const char* pat, const char* str) {
-    const char* star = nullptr;
-    const char* ss = str;
-    while (*str) {
-        if (*pat == '?' || *pat == *str) { ++pat; ++str; }
-        else if (*pat == '*') { star = pat++; ss = str; }
-        else if (star) { pat = star + 1; str = ++ss; }
-        else return false;
-    }
-    while (*pat == '*') ++pat;
-    return *pat == '\0';
-}
 
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -39,13 +22,7 @@ bool Config::matchesPackage(const char* name) const {
     if (target_packages.empty()) return false;  // ничего не хукаем по умолчанию
     for (const auto& p : target_packages) {
         if (p == "*" || p == "all") return true;
-        // Pattern entries (contain '*' or '?') are glob-matched; everything else
-        // is an exact package-name match (unchanged behaviour for plain names).
-        if (p.find('*') != std::string::npos || p.find('?') != std::string::npos) {
-            if (globMatch(p.c_str(), name)) return true;
-        } else if (p == name) {
-            return true;
-        }
+        if (p == name) return true;
     }
     return false;
 }
@@ -53,7 +30,7 @@ bool Config::matchesPackage(const char* name) const {
 // Parse config text (in-memory). Resets g_config to defaults first so repeated
 // loads (e.g. fd fallback then file) do not accumulate duplicate targets.
 static void parseConfigText(const std::string& content) {
-    g_config.target_packages.clear();
+    g_config = Config{};
     size_t pos = 0;
     while (pos < content.size()) {
         size_t nl = content.find('\n', pos);
@@ -84,27 +61,14 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "multiplier") {
             g_config.multiplier = atoi(val.c_str());
             if (g_config.multiplier < 1) g_config.multiplier = 1;
-        } else if (key == "warmup_frames") {
-            g_config.warmup_frames = atoi(val.c_str());
-            if (g_config.warmup_frames < 0) g_config.warmup_frames = 0;
-        } else if (key == "mc_interp") {
-            g_config.mc_interp = (val == "1" || val == "true");
-        } else if (key == "mc_tile") {
-            g_config.mc_tile = atoi(val.c_str());
-            if (g_config.mc_tile < 4) g_config.mc_tile = 4;
-        } else if (key == "mc_search") {
-            g_config.mc_search = atoi(val.c_str());
-            if (g_config.mc_search < 1) g_config.mc_search = 1;
-        } else if (key == "mc_levels") {
-            g_config.mc_levels = atoi(val.c_str());
-            if (g_config.mc_levels < 1) g_config.mc_levels = 1;
-        } else if (key == "mc_occl") {
-            g_config.mc_occl = (float)atof(val.c_str());
-            if (g_config.mc_occl < 0.001f) g_config.mc_occl = 0.001f;
-        } else if (key == "mc_bilinear") {
-            g_config.mc_bilinear = (val == "1" || val == "true") ? 1 : 0;
         } else if (key == "method") {
-            g_config.method = (val == "extrapolate" || val == "reproject") ? Method::Extrapolate : Method::Blend;
+            if (val == "flow" || val == "optical_flow" || val == "motion") {
+                g_config.method = Method::Flow;
+            } else if (val == "extrapolate" || val == "reproject") {
+                g_config.method = Method::Extrapolate;
+            } else {
+                g_config.method = Method::Blend;
+            }
         } else if (key == "max_fps") {
             g_config.max_fps = atoi(val.c_str());
             if (g_config.max_fps < 0) g_config.max_fps = 0;
@@ -127,6 +91,18 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "blur_radius") {
             g_config.blur_radius = atoi(val.c_str());
             if (g_config.blur_radius < 0) g_config.blur_radius = 0;
+        } else if (key == "flow_search_radius") {
+            g_config.flow_search_radius = atoi(val.c_str());
+            if (g_config.flow_search_radius < 0) g_config.flow_search_radius = 0;
+            if (g_config.flow_search_radius > 12) g_config.flow_search_radius = 12;
+        } else if (key == "flow_patch_radius") {
+            g_config.flow_patch_radius = atoi(val.c_str());
+            if (g_config.flow_patch_radius < 0) g_config.flow_patch_radius = 0;
+            if (g_config.flow_patch_radius > 3) g_config.flow_patch_radius = 3;
+        } else if (key == "flow_confidence_scale") {
+            g_config.flow_confidence_scale = (float)atof(val.c_str());
+            if (g_config.flow_confidence_scale < 0.1f) g_config.flow_confidence_scale = 0.1f;
+            if (g_config.flow_confidence_scale > 30.0f) g_config.flow_confidence_scale = 30.0f;
         } else if (key == "interop_bench") {
             g_config.interop_bench = (val == "1" || val == "true");
         
@@ -138,18 +114,17 @@ static void parseConfigText(const std::string& content) {
         }
     }
 
-    LOGI("config loaded: %zu target(s), mode=%d mult=%d warmup=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
+    LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
-         g_config.warmup_frames, g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
+         g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
+    LOGI("flow params: search=%d patch=%d conf_scale=%.3f",
+         g_config.flow_search_radius, g_config.flow_patch_radius,
+         g_config.flow_confidence_scale);
     LOGI("interop_bench=%d", g_config.interop_bench);
-    LOGI("mc params: interp=%d tile=%d search=%d levels=%d occl=%.3f",
-         g_config.mc_interp, g_config.mc_tile, g_config.mc_search,
-         g_config.mc_levels, g_config.mc_occl);
-    LOGI("mc perf: bilinear=%d", g_config.mc_bilinear);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
     LOGI("extrap_eval=%d", g_config.extrap_eval);
 }

@@ -65,13 +65,7 @@ public:
         const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
         targetProcess = g_config.matchesPackage(pkg);
         if (pkg) {
-            if (targetProcess) {
-                // Remember the real package of THIS process so the Vulkan path
-                // connects the vendor engine to the right app (the target list
-                // may contain many apps and/or wildcard patterns).
-                g_config.current_package = pkg;
-                LOGI("cleanfg target matched: %s", pkg);
-            }
+            if (targetProcess) LOGI("cleanfg target matched: %s", pkg);
             env->ReleaseStringUTFChars(args->nice_name, pkg);
         }
 
