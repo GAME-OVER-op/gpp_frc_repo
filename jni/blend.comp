@@ -1,14 +1,15 @@
 #version 450
 // cleanfg single generation path: adaptive temporal blend.
 //
-// Goal: keep the original fast 120 FPS path, but make the inserted frame look
-// less like a hard duplicate/mix. We do not run full optical flow here. Instead
-// we use FSR-style ideas that are cheap with only final backbuffers available:
-// - reactivity: where prev/cur differ a lot, trust the current frame more;
-// - reset-like behavior: fast/cut-like changes become a soft current-frame
-//   transition instead of trying to preserve stale history;
-// - motion-zone softening: add a tiny current-frame blur only where motion is
-//   detected, hiding judder/tears without a heavy vector search.
+// The goal is to keep the original fast 120 FPS path while making inserted
+// frames look like smooth transitions, not hard duplicates. This pass is inspired
+// by FSR temporal concepts that are useful even when we only have final
+// backbuffers and no game motion vectors/depth:
+// - reactive mask: unstable pixels trust current frame more than history;
+// - composition mask: softening is spatially coherent, not pixel-speckled;
+// - instability/reset mask: extreme changes become a soft current-frame reset;
+// - neighborhood color clipping: the generated color stays inside plausible
+//   prev/cur neighborhoods, reducing colored spots on particles/effects.
 //
 // All images are storage images in the swapchain format (rgba8 declaration is
 // used for typed storage access; channel order is treated symmetrically).
@@ -19,7 +20,7 @@ layout(set = 0, binding = 2, rgba8) uniform writeonly image2D outImg;
 
 layout(push_constant) uniform Params {
     float baseAlpha;      // static-scene temporal midpoint, normally 0.50..0.58
-    float diffThreshold;  // motion/reactivity starts above this luma delta
+    float diffThreshold;  // motion/reactivity starts above this delta
     float diffSoftness;   // smooth transition width above threshold
     float motionStrength; // 0..1 amount of current-frame reactivity
     int   blurRadius;     // 0=off, 1=cheap 5-tap softening, 2=slightly softer
@@ -27,6 +28,7 @@ layout(push_constant) uniform Params {
 
 float sat(float x) { return clamp(x, 0.0, 1.0); }
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float max3(vec3 v) { return max(v.x, max(v.y, v.z)); }
 
 ivec2 clampPx(ivec2 p, ivec2 sz) {
     return clamp(p, ivec2(0), sz - ivec2(1));
@@ -35,10 +37,19 @@ ivec2 clampPx(ivec2 p, ivec2 sz) {
 vec4 loadPrev(ivec2 p, ivec2 sz) { return imageLoad(prevImg, clampPx(p, sz)); }
 vec4 loadCur(ivec2 p, ivec2 sz)  { return imageLoad(curImg,  clampPx(p, sz)); }
 
+float frameDeltaAt(ivec2 p, ivec2 sz) {
+    vec3 a = loadPrev(p, sz).rgb;
+    vec3 b = loadCur(p, sz).rgb;
+    float ld = abs(luma(b - a));
+    // Particles, glows and elemental effects may change mostly in chroma. FSR's
+    // auto-reactive path can use component deltas; we mirror that cheaply here.
+    float cd = max3(abs(b - a));
+    return max(ld, cd * 0.72);
+}
+
 vec4 blurCur5(ivec2 p, ivec2 sz) {
-    // Very cheap cross blur. It is intentionally current-frame only: when motion
-    // is unreliable, current is the safe source and blur just masks the temporal
-    // gap between real frames.
+    // Cheap cross blur. It is intentionally current-frame only: when motion is
+    // unreliable, current is the safe source and blur masks the temporal gap.
     vec4 c = loadCur(p, sz) * 0.40;
     c += loadCur(p + ivec2( 1,  0), sz) * 0.15;
     c += loadCur(p + ivec2(-1,  0), sz) * 0.15;
@@ -56,15 +67,43 @@ vec4 blurCur9(ivec2 p, ivec2 sz) {
     return c;
 }
 
-float neighborMotion(ivec2 p, ivec2 sz) {
-    // A tiny neighborhood reactivity estimate. It catches thin moving edges that
-    // a single-pixel prev/cur difference can miss, while avoiding expensive flow.
-    float d = 0.0;
-    d += abs(luma(loadCur(p + ivec2( 1,  0), sz).rgb - loadPrev(p + ivec2( 1,  0), sz).rgb));
-    d += abs(luma(loadCur(p + ivec2(-1,  0), sz).rgb - loadPrev(p + ivec2(-1,  0), sz).rgb));
-    d += abs(luma(loadCur(p + ivec2( 0,  1), sz).rgb - loadPrev(p + ivec2( 0,  1), sz).rgb));
-    d += abs(luma(loadCur(p + ivec2( 0, -1), sz).rgb - loadPrev(p + ivec2( 0, -1), sz).rgb));
-    return d * 0.25;
+float neighborAvgDelta(ivec2 p, ivec2 sz) {
+    float d = frameDeltaAt(p, sz) * 0.36;
+    d += frameDeltaAt(p + ivec2( 1,  0), sz) * 0.16;
+    d += frameDeltaAt(p + ivec2(-1,  0), sz) * 0.16;
+    d += frameDeltaAt(p + ivec2( 0,  1), sz) * 0.16;
+    d += frameDeltaAt(p + ivec2( 0, -1), sz) * 0.16;
+    return d;
+}
+
+float neighborMaxDelta(ivec2 p, ivec2 sz) {
+    float d = frameDeltaAt(p, sz);
+    d = max(d, frameDeltaAt(p + ivec2( 1,  0), sz));
+    d = max(d, frameDeltaAt(p + ivec2(-1,  0), sz));
+    d = max(d, frameDeltaAt(p + ivec2( 0,  1), sz));
+    d = max(d, frameDeltaAt(p + ivec2( 0, -1), sz));
+    return d;
+}
+
+void neighborhoodBounds(ivec2 p, ivec2 sz, out vec3 mn, out vec3 mx) {
+    // Small current/previous neighborhood min/max. This is a cheap version of
+    // temporal color clipping: particles/effects stay bright and smooth, but the
+    // generated frame cannot create isolated impossible color spots.
+    vec3 c0 = loadCur(p, sz).rgb;
+    vec3 p0 = loadPrev(p, sz).rgb;
+    mn = min(c0, p0);
+    mx = max(c0, p0);
+
+    vec3 s;
+    s = loadCur(p + ivec2( 1,  0), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadCur(p + ivec2(-1,  0), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadCur(p + ivec2( 0,  1), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadCur(p + ivec2( 0, -1), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+
+    s = loadPrev(p + ivec2( 1,  0), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadPrev(p + ivec2(-1,  0), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadPrev(p + ivec2( 0,  1), sz).rgb; mn = min(mn, s); mx = max(mx, s);
+    s = loadPrev(p + ivec2( 0, -1), sz).rgb; mn = min(mn, s); mx = max(mx, s);
 }
 
 void main() {
@@ -75,39 +114,58 @@ void main() {
     vec4 prev = imageLoad(prevImg, p);
     vec4 cur  = imageLoad(curImg, p);
 
-    float dl = abs(luma(cur.rgb - prev.rgb));
-    float nd = neighborMotion(p, sz);
-    float colorDelta = max(dl, nd);
+    float centerDelta = frameDeltaAt(p, sz);
+    float avgDelta    = neighborAvgDelta(p, sz);
+    float maxDelta    = neighborMaxDelta(p, sz);
 
     float hi = pc.diffThreshold + max(pc.diffSoftness, 1e-4);
-    float motion = smoothstep(pc.diffThreshold, hi, colorDelta);
-    motion = sat(motion * pc.motionStrength);
 
-    // FSR-like reactivity: in unstable pixels, reduce influence of history and
-    // bias the inserted frame toward current. This avoids double images on fast
-    // pans and alpha/UI-like elements where we do not have true motion vectors.
+    // Three internal masks, one public method:
+    // reactive:    current-frame contribution, fairly local to preserve detail.
+    // composition: softening/transition mask, more spatially coherent to avoid
+    //              speckles when many small elements move independently.
+    // instability: mini-reset only for very large local/global changes.
+    float reactive = smoothstep(pc.diffThreshold, hi, max(centerDelta, avgDelta * 0.85));
+    reactive = sat(reactive * pc.motionStrength);
+    reactive = min(reactive, 0.90); // FSR-style: avoid fully reactive hard snaps.
+
+    float composition = smoothstep(pc.diffThreshold * 0.82, hi * 1.08, mix(avgDelta, maxDelta, 0.35));
+    composition = sat(composition * (0.70 + 0.45 * pc.motionStrength));
+
+    float instability = smoothstep(hi * 1.15, hi * 2.15, max(maxDelta, centerDelta * 1.25));
+
+    // Current-biased temporal blend. In stable areas this is near the midpoint;
+    // in reactive areas history influence fades smoothly instead of tearing.
     float baseAlpha = sat(pc.baseAlpha);
     float curReactiveAlpha = 0.86;
-    float alpha = mix(baseAlpha, curReactiveAlpha, motion);
+    float alpha = mix(baseAlpha, curReactiveAlpha, reactive);
     vec4 temporal = mix(prev, cur, alpha);
 
-    // Local detail/contrast protection: don't over-blur small sharp features.
     vec4 curSoft5 = blurCur5(p, sz);
-    vec4 curSoft = (pc.blurRadius >= 2) ? blurCur9(p, sz) : curSoft5;
+    vec4 curSoft  = (pc.blurRadius >= 2) ? blurCur9(p, sz) : curSoft5;
+
+    // Do not remove blur from fine-detail games. Instead, make its mask coherent
+    // and clip the result later. Detail only slightly moderates the blur so tiny
+    // particles keep smooth motion rather than turning into hard flicker.
     float detail = length(cur.rgb - curSoft5.rgb);
-    float detailProtect = smoothstep(0.035, 0.16, detail);
+    float detailModeration = smoothstep(0.06, 0.24, detail);
+    float blurAmt = composition * (pc.blurRadius > 0 ? 0.38 : 0.0);
+    blurAmt *= mix(1.0, 0.72, detailModeration);
 
-    // Motion softening is deliberately modest. It hides missing intermediate
-    // geometry during fast turns, but keeps static/slow regions crisp.
-    float blurAmt = motion * (pc.blurRadius > 0 ? 0.42 : 0.0);
-    blurAmt *= mix(1.0, 0.45, detailProtect);
-
-    // Extreme changes behave like a mini reset: mostly current frame plus a soft
-    // transition. This is preferable to showing a stale blended frame that looks
-    // like a dropped/torn frame during sharp camera turns.
-    float cut = smoothstep(hi, hi + max(pc.diffSoftness, 1e-4), colorDelta);
     vec4 softCurrent = mix(cur, curSoft, blurAmt);
-    vec4 outc = mix(temporal, softCurrent, max(blurAmt, cut * 0.35));
+
+    // Instability works like a tiny reset: it prefers a soft current transition
+    // over an invalid history mix, but remains capped so fast effects do not pop.
+    float resetMix = max(blurAmt, instability * 0.42);
+    vec4 outc = mix(temporal, softCurrent, resetMix);
+
+    // Neighborhood color clipping: reduce isolated colored spots while keeping
+    // bright particles/effects because bounds are taken from both frames and a
+    // small cross-neighborhood, not just the center pixel.
+    vec3 mn, mx;
+    neighborhoodBounds(p, sz, mn, mx);
+    float margin = mix(0.020, 0.065, max(composition, instability));
+    outc.rgb = clamp(outc.rgb, mn - vec3(margin), mx + vec3(margin));
 
     imageStore(outImg, p, outc);
 }
