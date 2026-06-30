@@ -422,14 +422,10 @@ bool ensureBlend(SwapInfo& sw, DevFns& f) {
 // Push-constant block fed to the GPU blend shader (layout must match blend.comp).
 struct BlendPC {
     float baseAlpha;       // static-scene blend (0.5 = even)
-    float diffThreshold;   // luma-diff below this -> full blend
+    float diffThreshold;   // luma-diff motion sensitivity
     float diffSoftness;    // smoothstep width above threshold
-    float motionStrength;  // 0..1 scales how hard motion kills the blend
-    int32_t blurRadius;    // 0 = off; >0 = box-blur radius in high-motion zones
-    int32_t method;        // 0=adaptive blend, 1=screen-space optical flow
-    int32_t searchRadius;  // flow search radius in pixels
-    int32_t patchRadius;   // flow SAD patch radius
-    float confidenceScale; // flow match rejection scale
+    float motionStrength;  // 0..1 scales current-frame reactivity
+    int32_t blurRadius;    // 0 = off; >0 = cheap motion-zone softening
 };
 
 bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
@@ -619,10 +615,7 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
         f.cmdBindPipeline(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipe);
         f.cmdBindDescSets(sw.injCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sw.gPipeLayout, 0, 1, &sw.gDescSet, 0, nullptr);
         BlendPC pc{ g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
-                   g_config.motion_strength, g_config.blur_radius,
-                   g_config.method == Method::Flow ? 1 : 0,
-                   g_config.flow_search_radius, g_config.flow_patch_radius,
-                   g_config.flow_confidence_scale };
+                   g_config.motion_strength, g_config.blur_radius };
         f.cmdPushConst(sw.injCmd, sw.gPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(BlendPC), &pc);
         uint32_t gx = (sw.extent.width + 7) / 8, gy = (sw.extent.height + 7) / 8;
         f.cmdDispatch(sw.injCmd, gx, gy, 1);

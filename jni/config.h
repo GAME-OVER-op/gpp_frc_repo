@@ -5,7 +5,7 @@
 namespace cleanfg {
 
 enum class Mode { Auto, Gles, Vulkan };
-enum class Method { Blend, Flow, Extrapolate };
+enum class Method { Blend, Extrapolate };
 
 struct Config {
     std::vector<std::string> target_packages;
@@ -17,18 +17,14 @@ struct Config {
     bool force_swap_interval_0 = true;
     bool present_bridge = false;  // Stage 1: inject duplicate presents (frame-gen bridge)
     bool debug = false;
-    // Stage 2B adaptive blend knobs (tunable live via cleanfg.prop)
-    float blend_alpha = 0.5f;       // base blend on static scenes
-    float diff_threshold = 0.08f;   // luma-diff motion sensitivity
-    float diff_softness = 0.12f;    // smoothstep width above threshold
-    float motion_strength = 1.0f;   // 0..1 how hard motion kills blend
-    int blur_radius = 0;            // 0 = off; box-blur radius in motion zones
-    // Lightweight screen-space optical-flow interpolation. This is used by the
-    // Vulkan present bridge when method=flow. The shader estimates motion from
-    // prev/cur color directly, so it does not need game-provided motion vectors.
-    int flow_search_radius = 4;      // pixels around current sample to search
-    int flow_patch_radius = 1;       // SAD patch radius; 1 => 3x3 luma patch
-    float flow_confidence_scale = 6.0f; // higher = reject bad vector matches sooner
+    // Single system generation path: adaptive blend with current-frame
+    // reactivity and cheap motion-softening. These are kept tunable only while
+    // we tune picture quality; later they can become internal constants.
+    float blend_alpha = 0.52f;      // base blend on static scenes
+    float diff_threshold = 0.055f;  // luma-diff motion sensitivity
+    float diff_softness = 0.18f;    // smoothstep width above threshold
+    float motion_strength = 0.85f;  // 0..1 how hard motion kills blend
+    int blur_radius = 1;            // 0 = off; box-blur radius in motion zones
     bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
     bool extrap_bench = false;      // Stage 2: run one-shot glExtrapolateTex2DQCOM probe
     bool extrap_eval = false;       // Stage 2: objective ME prediction eval (logcat only)

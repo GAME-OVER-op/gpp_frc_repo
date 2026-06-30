@@ -62,9 +62,10 @@ static void parseConfigText(const std::string& content) {
             g_config.multiplier = atoi(val.c_str());
             if (g_config.multiplier < 1) g_config.multiplier = 1;
         } else if (key == "method") {
-            if (val == "flow" || val == "optical_flow" || val == "motion") {
-                g_config.method = Method::Flow;
-            } else if (val == "extrapolate" || val == "reproject") {
+            // For now there is one production generation path: method=blend.
+            // Old/experimental values are intentionally folded back to Blend so
+            // a stale cleanfg.prop cannot re-enable the expensive full-res flow.
+            if (val == "extrapolate" || val == "reproject") {
                 g_config.method = Method::Extrapolate;
             } else {
                 g_config.method = Method::Blend;
@@ -91,18 +92,6 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "blur_radius") {
             g_config.blur_radius = atoi(val.c_str());
             if (g_config.blur_radius < 0) g_config.blur_radius = 0;
-        } else if (key == "flow_search_radius") {
-            g_config.flow_search_radius = atoi(val.c_str());
-            if (g_config.flow_search_radius < 0) g_config.flow_search_radius = 0;
-            if (g_config.flow_search_radius > 12) g_config.flow_search_radius = 12;
-        } else if (key == "flow_patch_radius") {
-            g_config.flow_patch_radius = atoi(val.c_str());
-            if (g_config.flow_patch_radius < 0) g_config.flow_patch_radius = 0;
-            if (g_config.flow_patch_radius > 3) g_config.flow_patch_radius = 3;
-        } else if (key == "flow_confidence_scale") {
-            g_config.flow_confidence_scale = (float)atof(val.c_str());
-            if (g_config.flow_confidence_scale < 0.1f) g_config.flow_confidence_scale = 0.1f;
-            if (g_config.flow_confidence_scale > 30.0f) g_config.flow_confidence_scale = 30.0f;
         } else if (key == "interop_bench") {
             g_config.interop_bench = (val == "1" || val == "true");
         
@@ -121,9 +110,6 @@ static void parseConfigText(const std::string& content) {
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
-    LOGI("flow params: search=%d patch=%d conf_scale=%.3f",
-         g_config.flow_search_radius, g_config.flow_patch_radius,
-         g_config.flow_confidence_scale);
     LOGI("interop_bench=%d", g_config.interop_bench);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
     LOGI("extrap_eval=%d", g_config.extrap_eval);
