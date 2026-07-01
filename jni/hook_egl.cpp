@@ -36,8 +36,17 @@ static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
     if(!g_inited){ EGLint w=0,h=0; eglQuerySurface(dpy,surface,EGL_WIDTH,&w); eglQuerySurface(dpy,surface,EGL_HEIGHT,&h); g_ctx.width=w; g_ctx.height=h; fgInitGles(w,h); g_inited=true; }
     fgCaptureCurrentGles(g_ctx);
     float fps=fgMeasuredFps(g_ctx); if(fps>1.f) requestBestFrameRate(surface,fps);
-    if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)) orig_eglSwapBuffers(dpy,surface);
-    EGLBoolean r=orig_eglSwapBuffers(dpy,surface);
+    EGLBoolean r=EGL_FALSE;
+    if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)){
+        // We replaced the app backbuffer with the generated frame and presented it.
+        // After eglSwapBuffers the new backbuffer contents are undefined on many
+        // Android drivers. Presenting it immediately causes a full black frame in
+        // GLES games such as Asphalt 8. Repaint the real/current frame from the
+        // captured texture before the second present.
+        orig_eglSwapBuffers(dpy,surface);
+        fgRenderCurrentGles(g_ctx);
+    }
+    r=orig_eglSwapBuffers(dpy,surface);
     g_inside=false; return r;
 }
 

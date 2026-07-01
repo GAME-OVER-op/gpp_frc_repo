@@ -153,3 +153,9 @@ dlopen failed: library "vendor.qti.hardware.vpp-V1-ndk.so" not found:
 через `android_dlopen_ext` уже в этом namespace — DT_NEEDED на вендорную либу
 резолвится. Старые способы (plain dlopen, exported namespaces) оставлены как
 fallback.
+
+### Stage 3.3: GLES black-frame fix for double-present path
+
+Asphalt 8 confirms a GLES/EGL path: `mode=gles` installs EGL hooks and requests 120 Hz, but the screen can become black after the generated-frame present. The cause is Android EGL backbuffer invalidation after `eglSwapBuffers`: after presenting the generated frame, the next backbuffer contents are undefined on some drivers, so immediately presenting again may queue a black frame instead of the real game frame.
+
+Fix: after the generated GLES present, repaint the captured current frame from the internal texture before the second `eglSwapBuffers`. This keeps the 2x present order as generated-frame -> real-frame without relying on preserved swapchain/backbuffer contents. Also clamp the automatic 2x display-rate request around 60 FPS to 120 Hz to avoid noisy 120/144 oscillation.

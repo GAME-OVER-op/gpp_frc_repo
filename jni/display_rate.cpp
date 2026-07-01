@@ -59,6 +59,12 @@ float chooseTargetRate(float measuredGameFps) {
     if (measuredGameFps <= 1.0f) return 0.0f;
     float target = measuredGameFps * (float)g_config.multiplier;
     if (g_config.max_fps > 0 && target > (float)g_config.max_fps) target = (float)g_config.max_fps;
+    // Avoid oscillating 120<->144 when a 60 FPS game jitters slightly above
+    // 60.0. On 120 Hz phones this only creates noisy mode requests; the real
+    // generation target for 2x is 120.
+    if (g_config.max_fps == 0 && g_config.multiplier == 2 && target > 108.0f && target < 132.0f) {
+        target = 120.0f;
+    }
     // Snap to common Android panel modes. OS will still clamp to real supported mode.
     const float modes[] = {60, 72, 90, 96, 120, 144, 165};
     float best = target;

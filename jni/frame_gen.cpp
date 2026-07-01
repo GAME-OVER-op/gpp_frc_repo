@@ -72,6 +72,18 @@ bool fgRenderGeneratedGles(FrameContext& ctx){
     restoreCommon(oldProg,oldTex,oldFbo,oldVp,blend); return true;
 }
 
+bool fgRenderCurrentGles(FrameContext& ctx){
+    if(!g.ready) return false;
+    GLint oldProg, oldTex, oldFbo, oldVp[4]; GLboolean blend; saveCommon(oldProg,oldTex,oldFbo,oldVp,blend);
+    glDisable(GL_BLEND); glBindFramebuffer(GL_FRAMEBUFFER,0); glViewport(0,0,g.w,g.h); glUseProgram(g.program);
+    int cur=g.current;
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,g.tex[cur]); glUniform1i(glGetUniformLocation(g.program,"prevTex"),0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,g.tex[cur]); glUniform1i(glGetUniformLocation(g.program,"curTex"),1);
+    glUniform1f(glGetUniformLocation(g.program,"alpha"),1.0f);
+    glBindVertexArray(g.vao); glDrawArrays(GL_TRIANGLES,0,3); glBindVertexArray(0); glFlush();
+    restoreCommon(oldProg,oldTex,oldFbo,oldVp,blend); return true;
+}
+
 float fgMeasuredFps(const FrameContext& ctx){ if(ctx.avgFrameNs<=0) return 0.f; return 1000000000.f/(float)ctx.avgFrameNs; }
 bool fgOnPresentVulkan(void*, const void*, FrameContext& ctx){ ctx.frameIndex++; return false; }
 }
