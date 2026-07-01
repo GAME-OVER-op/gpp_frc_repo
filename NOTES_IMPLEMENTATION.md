@@ -173,3 +173,7 @@ To isolate the exact GLES failure point, add `gles_debug_mode`:
 - `current_only` / `5`: replace the real frame with captured current texture once.
 
 This build also clamps unstable first FPS samples above 180 FPS to a 120 Hz request to avoid absurd mode requests during startup.
+
+### Stage 3.6: build fix for GLES diagnostic modes
+
+GitHub Actions failed because `hook_egl.cpp` called `fgRenderCurrentGles(...)`, but the function prototype was missing from `frame_gen.h`. Add the declaration so both `hook_egl.cpp` and `frame_gen.cpp` agree during compilation for arm64 and armeabi-v7a.
