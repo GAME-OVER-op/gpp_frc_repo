@@ -199,3 +199,7 @@ The production configuration is now intentionally minimal: `cleanfg.prop` expose
 Auto backend selection installs both Vulkan and EGL hooks, but only the backend that actually presents frames becomes active. Vulkan surface/device/swapchain creation marks a Vulkan candidate; GLES waits briefly in auto mode so UI/EGL setup cannot steal the process from a real Vulkan renderer. The first real `vkQueuePresentKHR` selects Vulkan; otherwise `eglSwapBuffers` selects GLES. After selection, the other backend passes through without generating frames.
 
 GLES now also resets temporal history after large frame-time discontinuities and uses `eglPresentationTimeANDROID` when available to hint generated/real frame pacing at half-frame intervals.
+
+### Stage 4.1: stabilize 120 Hz production target
+
+The first production auto build could request 60/72/90 Hz when measured app FPS dipped during GLES capture/generation. That made Asphalt oscillate between 60-90 instead of holding the display at the intended 120 Hz target. For the production 2x path, keep the display request pinned to 120 Hz whenever the measured game loop is at least ~24 FPS and max_fps is automatic. Android still clamps to the actual supported panel mode.

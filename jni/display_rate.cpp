@@ -57,6 +57,14 @@ void forgetWindowForSurface(EGLSurface surface) {
 
 float chooseTargetRate(float measuredGameFps) {
     if (measuredGameFps <= 1.0f) return 0.0f;
+    // Production 2x path is designed for a stable 120 Hz presentation target.
+    // Do not downshift the display request to 60/72/90 when the measured app
+    // frame time jitters during capture/generation; that causes exactly the
+    // 60-90 oscillation we are trying to avoid. Android/SurfaceFlinger will
+    // clamp 120 to the real supported panel mode if needed.
+    if (g_config.max_fps == 0 && g_config.multiplier == 2 && measuredGameFps >= 24.0f) {
+        return 120.0f;
+    }
     // Ignore first unstable samples after hook/context creation. Some games can
     // briefly report hundreds/thousands FPS before their render loop settles.
     if (measuredGameFps > 180.0f && g_config.max_fps == 0) return 120.0f;
