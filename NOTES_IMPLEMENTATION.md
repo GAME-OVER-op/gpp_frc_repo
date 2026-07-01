@@ -154,8 +154,22 @@ dlopen failed: library "vendor.qti.hardware.vpp-V1-ndk.so" not found:
 резолвится. Старые способы (plain dlopen, exported namespaces) оставлены как
 fallback.
 
-### Stage 3.3: GLES black-frame fix for double-present path
+### Stage 3.4: GLES state isolation
 
-Asphalt 8 confirms a GLES/EGL path: `mode=gles` installs EGL hooks and requests 120 Hz, but the screen can become black after the generated-frame present. The cause is Android EGL backbuffer invalidation after `eglSwapBuffers`: after presenting the generated frame, the next backbuffer contents are undefined on some drivers, so immediately presenting again may queue a black frame instead of the real game frame.
+Asphalt 8 still showed a black screen after the repaint fix, which points to GL state corruption or drawing with inherited app state. GLES games often leave depth/scissor/cull tests, color masks, texture bindings, VAOs, read/draw FBOs and active texture units in arbitrary states at `eglSwapBuffers`. The hook was not restoring enough state after capture/render, so a frame-generation draw could break the game's next frame or draw black under inherited state.
 
-Fix: after the generated GLES present, repaint the captured current frame from the internal texture before the second `eglSwapBuffers`. This keeps the 2x present order as generated-frame -> real-frame without relying on preserved swapchain/backbuffer contents. Also clamp the automatic 2x display-rate request around 60 FPS to 120 Hz to avoid noisy 120/144 oscillation.
+Fix: isolate GLES capture/render with explicit state save/restore for framebuffers, active texture and texture bindings, VAO/VBO, viewport, program, color/depth masks and common enable bits. The generated/current fullscreen pass now disables depth/stencil/scissor/cull/blend and forces color writes before drawing, then restores the app state.
+
+### Stage 3.5: GLES compatibility diagnostic modes
+
+The Asphalt diagnostic archive showed that the installed module was not the newest state-isolation build: the loaded `arm64-v8a.so` strings did not contain the new `gles frame-gen draw active`, `gles capture err`, or `gles render err` markers. The capture also confirmed the game uses a compressed 16-bit SurfaceView buffer (`req fmt:277`, fourcc `BG16`, UBWC), and the screenshot was ~96% black while EGL hooks and GLES init were active.
+
+To isolate the exact GLES failure point, add `gles_debug_mode`:
+- `framegen` / `0`: full GLES generated-frame path.
+- `passthrough` / `1`: hook only, no GL capture/draw and no extra present.
+- `capture_only` / `2`: run `glCopyTexSubImage2D`, then normal present only.
+- `draw_only` / `3`: capture and draw the current frame once, then normal present.
+- `double_present` / `4`: no draw between two presents; tests whether extra `eglSwapBuffers` itself breaks the Surface.
+- `current_only` / `5`: replace the real frame with captured current texture once.
+
+This build also clamps unstable first FPS samples above 180 FPS to a 120 Hz request to avoid absurd mode requests during startup.

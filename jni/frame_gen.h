@@ -13,7 +13,6 @@ struct FrameContext {
 };
 void fgInitGles(int width, int height);
 bool fgRenderGeneratedGles(FrameContext& ctx);
-bool fgRenderCurrentGles(FrameContext& ctx);
 void fgCaptureCurrentGles(FrameContext& ctx);
 float fgMeasuredFps(const FrameContext& ctx);
 bool fgOnPresentVulkan(void* queue, const void* pPresentInfo, FrameContext& ctx);

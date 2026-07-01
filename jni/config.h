@@ -25,6 +25,10 @@ struct Config {
     float diff_softness = 0.18f;    // smoothstep width above threshold
     float motion_strength = 0.85f;  // 0..1 how hard motion kills blend
     int blur_radius = 1;            // 0 = off; box-blur radius in motion zones
+    // GLES diagnostic modes for compatibility debugging:
+    // 0=framegen, 1=passthrough, 2=capture_only, 3=draw_only,
+    // 4=double_present, 5=current_only.
+    int gles_debug_mode = 0;
     bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
     bool extrap_bench = false;      // Stage 2: run one-shot glExtrapolateTex2DQCOM probe
     bool extrap_eval = false;       // Stage 2: objective ME prediction eval (logcat only)

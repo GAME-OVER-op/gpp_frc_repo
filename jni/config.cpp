@@ -92,6 +92,17 @@ static void parseConfigText(const std::string& content) {
         } else if (key == "blur_radius") {
             g_config.blur_radius = atoi(val.c_str());
             if (g_config.blur_radius < 0) g_config.blur_radius = 0;
+        } else if (key == "gles_debug_mode") {
+            if (val == "passthrough") g_config.gles_debug_mode = 1;
+            else if (val == "capture_only") g_config.gles_debug_mode = 2;
+            else if (val == "draw_only") g_config.gles_debug_mode = 3;
+            else if (val == "double_present") g_config.gles_debug_mode = 4;
+            else if (val == "current_only") g_config.gles_debug_mode = 5;
+            else if (val == "framegen" || val == "blend" || val.empty()) g_config.gles_debug_mode = 0;
+            else {
+                g_config.gles_debug_mode = atoi(val.c_str());
+                if (g_config.gles_debug_mode < 0 || g_config.gles_debug_mode > 5) g_config.gles_debug_mode = 0;
+            }
         } else if (key == "interop_bench") {
             g_config.interop_bench = (val == "1" || val == "true");
         
@@ -110,6 +121,7 @@ static void parseConfigText(const std::string& content) {
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
+    LOGI("gles_debug_mode=%d", g_config.gles_debug_mode);
     LOGI("interop_bench=%d", g_config.interop_bench);
     LOGI("extrap_bench=%d", g_config.extrap_bench);
     LOGI("extrap_eval=%d", g_config.extrap_eval);

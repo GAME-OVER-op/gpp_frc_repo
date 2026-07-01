@@ -19,6 +19,7 @@ static PFN_eglDestroySurface orig_eglDestroySurface=nullptr;
 static FrameContext g_ctx;
 static bool g_inited=false;
 static bool g_inside=false;
+static bool g_loggedMode=false;
 
 static EGLSurface my_eglCreateWindowSurface(EGLDisplay d,EGLConfig c,EGLNativeWindowType win,const EGLint* attr){
     EGLSurface s=orig_eglCreateWindowSurface(d,c,win,attr);
@@ -34,19 +35,29 @@ static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
     if(g_inside) return orig_eglSwapBuffers(dpy,surface);
     g_inside=true;
     if(!g_inited){ EGLint w=0,h=0; eglQuerySurface(dpy,surface,EGL_WIDTH,&w); eglQuerySurface(dpy,surface,EGL_HEIGHT,&h); g_ctx.width=w; g_ctx.height=h; fgInitGles(w,h); g_inited=true; }
+    if(g_config.debug && !g_loggedMode){ LOGI("gles debug mode active: %d", g_config.gles_debug_mode); g_loggedMode=true; }
+    if(g_config.gles_debug_mode==1){
+        float fps=fgMeasuredFps(g_ctx); if(fps>1.f) requestBestFrameRate(surface,fps);
+        EGLBoolean r=orig_eglSwapBuffers(dpy,surface);
+        g_inside=false; return r;
+    }
     fgCaptureCurrentGles(g_ctx);
     float fps=fgMeasuredFps(g_ctx); if(fps>1.f) requestBestFrameRate(surface,fps);
-    EGLBoolean r=EGL_FALSE;
-    if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)){
-        // We replaced the app backbuffer with the generated frame and presented it.
-        // After eglSwapBuffers the new backbuffer contents are undefined on many
-        // Android drivers. Presenting it immediately causes a full black frame in
-        // GLES games such as Asphalt 8. Repaint the real/current frame from the
-        // captured texture before the second present.
+    if(g_config.gles_debug_mode==2){
+        EGLBoolean r=orig_eglSwapBuffers(dpy,surface);
+        g_inside=false; return r;
+    }
+    if(g_config.gles_debug_mode==3){
+        fgRenderCurrentGles(g_ctx);
+    } else if(g_config.gles_debug_mode==4){
+        orig_eglSwapBuffers(dpy,surface);
+    } else if(g_config.gles_debug_mode==5){
+        fgRenderCurrentGles(g_ctx);
+    } else if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)){
         orig_eglSwapBuffers(dpy,surface);
         fgRenderCurrentGles(g_ctx);
     }
-    r=orig_eglSwapBuffers(dpy,surface);
+    EGLBoolean r=orig_eglSwapBuffers(dpy,surface);
     g_inside=false; return r;
 }
 
