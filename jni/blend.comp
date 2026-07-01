@@ -1,18 +1,15 @@
 #version 450
 // cleanfg single generation path: adaptive temporal blend.
 //
-// The goal is to keep the original fast 120 FPS path while making inserted
-// frames look like smooth transitions, not hard duplicates. This pass is inspired
-// by FSR temporal concepts that are useful even when we only have final
-// backbuffers and no game motion vectors/depth:
+// Fast app-side frame generation. This pass stays single-dispatch and avoids
+// full optical flow. It uses cheap FSR-inspired signals that work with only
+// final backbuffers:
 // - reactive mask: unstable pixels trust current frame more than history;
 // - composition mask: softening is spatially coherent, not pixel-speckled;
 // - instability/reset mask: extreme changes become a soft current-frame reset;
-// - neighborhood color clipping: the generated color stays inside plausible
-//   prev/cur neighborhoods, reducing colored spots on particles/effects.
-//
-// All images are storage images in the swapchain format (rgba8 declaration is
-// used for typed storage access; channel order is treated symmetrically).
+// - lightweight pan direction: four-direction local/global camera-motion hint;
+// - UI/static-detail heuristic: keep HUD/text stable without disabling motion;
+// - neighborhood color clipping: generated color stays inside plausible bounds.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8) uniform readonly  image2D prevImg;
 layout(set = 0, binding = 1, rgba8) uniform readonly  image2D curImg;
@@ -23,7 +20,7 @@ layout(push_constant) uniform Params {
     float diffThreshold;  // motion/reactivity starts above this delta
     float diffSoftness;   // smooth transition width above threshold
     float motionStrength; // 0..1 amount of current-frame reactivity
-    int   blurRadius;     // 0=off, 1=cheap 5-tap softening, 2=slightly softer
+    int   blurRadius;     // 0=off, 1=cheap softening, 2=slightly softer
 } pc;
 
 float sat(float x) { return clamp(x, 0.0, 1.0); }
@@ -37,34 +34,14 @@ ivec2 clampPx(ivec2 p, ivec2 sz) {
 vec4 loadPrev(ivec2 p, ivec2 sz) { return imageLoad(prevImg, clampPx(p, sz)); }
 vec4 loadCur(ivec2 p, ivec2 sz)  { return imageLoad(curImg,  clampPx(p, sz)); }
 
-float frameDeltaAt(ivec2 p, ivec2 sz) {
-    vec3 a = loadPrev(p, sz).rgb;
-    vec3 b = loadCur(p, sz).rgb;
+float colorDelta(vec3 a, vec3 b) {
     float ld = abs(luma(b - a));
-    // Particles, glows and elemental effects may change mostly in chroma. FSR's
-    // auto-reactive path can use component deltas; we mirror that cheaply here.
     float cd = max3(abs(b - a));
     return max(ld, cd * 0.72);
 }
 
-vec4 blurCur5(ivec2 p, ivec2 sz) {
-    // Cheap cross blur. It is intentionally current-frame only: when motion is
-    // unreliable, current is the safe source and blur masks the temporal gap.
-    vec4 c = loadCur(p, sz) * 0.40;
-    c += loadCur(p + ivec2( 1,  0), sz) * 0.15;
-    c += loadCur(p + ivec2(-1,  0), sz) * 0.15;
-    c += loadCur(p + ivec2( 0,  1), sz) * 0.15;
-    c += loadCur(p + ivec2( 0, -1), sz) * 0.15;
-    return c;
-}
-
-vec4 blurCur9(ivec2 p, ivec2 sz) {
-    vec4 c = blurCur5(p, sz) * 0.70;
-    c += loadCur(p + ivec2( 1,  1), sz) * 0.075;
-    c += loadCur(p + ivec2(-1,  1), sz) * 0.075;
-    c += loadCur(p + ivec2( 1, -1), sz) * 0.075;
-    c += loadCur(p + ivec2(-1, -1), sz) * 0.075;
-    return c;
+float frameDeltaAt(ivec2 p, ivec2 sz) {
+    return colorDelta(loadPrev(p, sz).rgb, loadCur(p, sz).rgb);
 }
 
 float neighborAvgDelta(ivec2 p, ivec2 sz) {
@@ -85,10 +62,64 @@ float neighborMaxDelta(ivec2 p, ivec2 sz) {
     return d;
 }
 
+vec4 blurCur5(ivec2 p, ivec2 sz) {
+    vec4 c = loadCur(p, sz) * 0.40;
+    c += loadCur(p + ivec2( 1,  0), sz) * 0.15;
+    c += loadCur(p + ivec2(-1,  0), sz) * 0.15;
+    c += loadCur(p + ivec2( 0,  1), sz) * 0.15;
+    c += loadCur(p + ivec2( 0, -1), sz) * 0.15;
+    return c;
+}
+
+vec4 blurCur9(ivec2 p, ivec2 sz) {
+    vec4 c = blurCur5(p, sz) * 0.70;
+    c += loadCur(p + ivec2( 1,  1), sz) * 0.075;
+    c += loadCur(p + ivec2(-1,  1), sz) * 0.075;
+    c += loadCur(p + ivec2( 1, -1), sz) * 0.075;
+    c += loadCur(p + ivec2(-1, -1), sz) * 0.075;
+    return c;
+}
+
+float shiftedDelta(ivec2 p, ivec2 dir, ivec2 sz) {
+    // Cheap camera/pan hint: if cur shifted in one direction matches prev better
+    // than cur at the same pixel, directional transition is safer than random
+    // local blur. Offset 2 catches fast pans while staying cheap.
+    return colorDelta(loadPrev(p, sz).rgb, loadCur(p + dir * 2, sz).rgb);
+}
+
+vec2 bestPanDir(ivec2 p, ivec2 sz, float centerDelta, out float dirConfidence) {
+    float eR = shiftedDelta(p, ivec2( 1,  0), sz);
+    float eL = shiftedDelta(p, ivec2(-1,  0), sz);
+    float eD = shiftedDelta(p, ivec2( 0,  1), sz);
+    float eU = shiftedDelta(p, ivec2( 0, -1), sz);
+
+    float best = eR; vec2 dir = vec2( 1.0,  0.0);
+    if (eL < best) { best = eL; dir = vec2(-1.0,  0.0); }
+    if (eD < best) { best = eD; dir = vec2( 0.0,  1.0); }
+    if (eU < best) { best = eU; dir = vec2( 0.0, -1.0); }
+
+    float improvement = centerDelta - best;
+    dirConfidence = sat(improvement / max(pc.diffSoftness * 0.65, 1e-4));
+    return dir;
+}
+
+vec4 directionalCurBlur(ivec2 p, ivec2 sz, vec2 dir) {
+    ivec2 d = ivec2(round(dir));
+    vec4 c = loadCur(p, sz) * 0.44;
+    c += loadCur(p + d,     sz) * 0.22;
+    c += loadCur(p - d,     sz) * 0.22;
+    c += loadCur(p + d * 2, sz) * 0.06;
+    c += loadCur(p - d * 2, sz) * 0.06;
+    return c;
+}
+
+float edgeStrength(ivec2 p, ivec2 sz) {
+    float cx = luma(loadCur(p + ivec2( 1, 0), sz).rgb) - luma(loadCur(p + ivec2(-1, 0), sz).rgb);
+    float cy = luma(loadCur(p + ivec2( 0, 1), sz).rgb) - luma(loadCur(p + ivec2( 0,-1), sz).rgb);
+    return abs(cx) + abs(cy);
+}
+
 void neighborhoodBounds(ivec2 p, ivec2 sz, out vec3 mn, out vec3 mx) {
-    // Small current/previous neighborhood min/max. This is a cheap version of
-    // temporal color clipping: particles/effects stay bright and smooth, but the
-    // generated frame cannot create isolated impossible color spots.
     vec3 c0 = loadCur(p, sz).rgb;
     vec3 p0 = loadPrev(p, sz).rgb;
     mn = min(c0, p0);
@@ -117,54 +148,58 @@ void main() {
     float centerDelta = frameDeltaAt(p, sz);
     float avgDelta    = neighborAvgDelta(p, sz);
     float maxDelta    = neighborMaxDelta(p, sz);
+    float hi          = pc.diffThreshold + max(pc.diffSoftness, 1e-4);
 
-    float hi = pc.diffThreshold + max(pc.diffSoftness, 1e-4);
+    float dirConf;
+    vec2 dir = bestPanDir(p, sz, centerDelta, dirConf);
 
-    // Three internal masks, one public method:
-    // reactive:    current-frame contribution, fairly local to preserve detail.
-    // composition: softening/transition mask, more spatially coherent to avoid
-    //              speckles when many small elements move independently.
-    // instability: mini-reset only for very large local/global changes.
+    // Single public method, multiple cheap internal masks.
     float reactive = smoothstep(pc.diffThreshold, hi, max(centerDelta, avgDelta * 0.85));
     reactive = sat(reactive * pc.motionStrength);
-    reactive = min(reactive, 0.90); // FSR-style: avoid fully reactive hard snaps.
+    reactive = min(reactive, 0.90);
 
     float composition = smoothstep(pc.diffThreshold * 0.82, hi * 1.08, mix(avgDelta, maxDelta, 0.35));
     composition = sat(composition * (0.70 + 0.45 * pc.motionStrength));
 
     float instability = smoothstep(hi * 1.15, hi * 2.15, max(maxDelta, centerDelta * 1.25));
 
-    // Current-biased temporal blend. In stable areas this is near the midpoint;
-    // in reactive areas history influence fades smoothly instead of tearing.
+    // UI/HUD/static-detail heuristic: strong sharp edges that did not move much
+    // should be current-biased but not heavily blurred. This keeps text/HUD from
+    // smearing while still allowing effects and particles to stay smooth.
+    float edge = edgeStrength(p, sz);
+    float staticSharp = smoothstep(0.16, 0.42, edge) * (1.0 - smoothstep(pc.diffThreshold, hi, centerDelta));
+
+    // Adaptive generation strength: when the scene is chaotic, reduce reliance on
+    // history smoothly; for directional camera pans, keep the transition smoother
+    // through directional blur instead of per-pixel speckles.
+    float pan = dirConf * composition;
+    reactive = sat(reactive + instability * 0.12 + pan * 0.06 + staticSharp * 0.10);
+
     float baseAlpha = sat(pc.baseAlpha);
-    float curReactiveAlpha = 0.86;
+    float curReactiveAlpha = mix(0.86, 0.91, instability);
     float alpha = mix(baseAlpha, curReactiveAlpha, reactive);
     vec4 temporal = mix(prev, cur, alpha);
 
-    vec4 curSoft5 = blurCur5(p, sz);
-    vec4 curSoft  = (pc.blurRadius >= 2) ? blurCur9(p, sz) : curSoft5;
+    vec4 curSoft = (pc.blurRadius >= 2) ? blurCur9(p, sz) : blurCur5(p, sz);
+    vec4 dirSoft = directionalCurBlur(p, sz, dir);
+    curSoft = mix(curSoft, dirSoft, sat(pan * 0.75));
 
-    // Do not remove blur from fine-detail games. Instead, make its mask coherent
-    // and clip the result later. Detail only slightly moderates the blur so tiny
-    // particles keep smooth motion rather than turning into hard flicker.
-    float detail = length(cur.rgb - curSoft5.rgb);
+    float detail = length(cur.rgb - blurCur5(p, sz).rgb);
     float detailModeration = smoothstep(0.06, 0.24, detail);
-    float blurAmt = composition * (pc.blurRadius > 0 ? 0.38 : 0.0);
-    blurAmt *= mix(1.0, 0.72, detailModeration);
+    float blurAmt = composition * (pc.blurRadius > 0 ? 0.34 : 0.0);
+    blurAmt *= mix(1.0, 0.74, detailModeration);
+    blurAmt *= mix(1.0, 0.48, staticSharp);
+    blurAmt = sat(blurAmt + pan * 0.10);
 
     vec4 softCurrent = mix(cur, curSoft, blurAmt);
-
-    // Instability works like a tiny reset: it prefers a soft current transition
-    // over an invalid history mix, but remains capped so fast effects do not pop.
-    float resetMix = max(blurAmt, instability * 0.42);
+    float resetMix = max(blurAmt, instability * 0.40);
     vec4 outc = mix(temporal, softCurrent, resetMix);
 
-    // Neighborhood color clipping: reduce isolated colored spots while keeping
-    // bright particles/effects because bounds are taken from both frames and a
-    // small cross-neighborhood, not just the center pixel.
     vec3 mn, mx;
     neighborhoodBounds(p, sz, mn, mx);
-    float margin = mix(0.020, 0.065, max(composition, instability));
+    float chroma = max3(abs(cur.rgb - prev.rgb));
+    float margin = mix(0.020, 0.064, max(composition, instability));
+    margin += chroma * 0.045; // wider bounds for bright VFX, still clipped.
     outc.rgb = clamp(outc.rgb, mn - vec3(margin), mx + vec3(margin));
 
     imageStore(outImg, p, outc);
