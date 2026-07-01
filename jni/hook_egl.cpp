@@ -20,6 +20,9 @@ static FrameContext g_ctx;
 static bool g_inited=false;
 static bool g_inside=false;
 static bool g_loggedMode=false;
+static bool g_forcedSwap0=false;
+static uint64_t g_swapCalls=0;
+static uint64_t g_generatedPresents=0;
 
 static EGLSurface my_eglCreateWindowSurface(EGLDisplay d,EGLConfig c,EGLNativeWindowType win,const EGLint* attr){
     EGLSurface s=orig_eglCreateWindowSurface(d,c,win,attr);
@@ -34,7 +37,13 @@ static EGLBoolean my_eglSwapInterval(EGLDisplay d,EGLint interval){
 static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
     if(g_inside) return orig_eglSwapBuffers(dpy,surface);
     g_inside=true;
+    g_swapCalls++;
     if(!g_inited){ EGLint w=0,h=0; eglQuerySurface(dpy,surface,EGL_WIDTH,&w); eglQuerySurface(dpy,surface,EGL_HEIGHT,&h); g_ctx.width=w; g_ctx.height=h; fgInitGles(w,h); g_inited=true; }
+    if(g_config.force_swap_interval_0 && orig_eglSwapInterval && !g_forcedSwap0){
+        EGLBoolean sr=orig_eglSwapInterval(dpy,0);
+        if(g_config.debug) LOGI("gles forced eglSwapInterval(0) in swap path result=%d", (int)sr);
+        g_forcedSwap0=true;
+    }
     if(g_config.debug && !g_loggedMode){ LOGI("gles debug mode active: %d", g_config.gles_debug_mode); g_loggedMode=true; }
     if(g_config.gles_debug_mode==1){
         float fps=fgMeasuredFps(g_ctx); if(fps>1.f) requestBestFrameRate(surface,fps);
@@ -55,7 +64,15 @@ static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
         fgRenderCurrentGles(g_ctx);
     } else if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)){
         orig_eglSwapBuffers(dpy,surface);
+        g_generatedPresents++;
         fgRenderCurrentGles(g_ctx);
+    }
+    if(g_config.debug && (g_swapCalls==1 || (g_swapCalls % 120)==0)){
+        LOGI("gles stats mode=%d appSwaps=%llu generatedPresents=%llu measuredFps=%.1f",
+             g_config.gles_debug_mode,
+             (unsigned long long)g_swapCalls,
+             (unsigned long long)g_generatedPresents,
+             fgMeasuredFps(g_ctx));
     }
     EGLBoolean r=orig_eglSwapBuffers(dpy,surface);
     g_inside=false; return r;

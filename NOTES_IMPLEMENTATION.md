@@ -177,3 +177,7 @@ This build also clamps unstable first FPS samples above 180 FPS to a 120 Hz requ
 ### Stage 3.6: build fix for GLES diagnostic modes
 
 GitHub Actions failed because `hook_egl.cpp` called `fgRenderCurrentGles(...)`, but the function prototype was missing from `frame_gen.h`. Add the declaration so both `hook_egl.cpp` and `frame_gen.cpp` agree during compilation for arm64 and armeabi-v7a.
+
+### Stage 3.7: GLES 60 FPS follow-up instrumentation
+
+After the diagnostic build produced a visible image but stayed at 60 FPS, add GLES-side instrumentation and force `eglSwapInterval(0)` from inside the first hooked `eglSwapBuffers` call as well as through the hooked `eglSwapInterval` entry point. Some GLES games set/restore swap interval before or after our install path, so forcing once from the active swap path makes the behavior explicit. The hook now logs app swap count, generated-present count, selected `gles_debug_mode`, and measured app FPS every ~120 swaps.
