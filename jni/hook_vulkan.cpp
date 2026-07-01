@@ -7,6 +7,7 @@
 // on-screen presentation of generated frames is the next milestone.
 #include "gpp_engine.h"
 #include "config.h"
+#include "backend_select.h"
 #include "log.h"
 #include "display_rate.h"
 #include <dlfcn.h>
@@ -673,6 +674,7 @@ bool injectBlend(VkQueue queue, VkSwapchainKHR swapchain, const VkPresentInfoKHR
 // ---- hooks ----
 VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
                             const VkAllocationCallbacks* alloc, VkSwapchainKHR* out) {
+    noteVulkanCandidate();
     // Present-bridge needs to copy INTO swapchain images, so force TRANSFER
     // usage. (Capture already proved TRANSFER_SRC works; we add TRANSFER_DST.)
     VkSwapchainCreateInfoKHR mci = *ci;
@@ -710,6 +712,10 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
 }
 
 VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
+    if (!tryActivateBackend(RuntimeBackend::Vulkan, "vkQueuePresentKHR")) {
+        return orig_QueuePresent(queue, info);
+    }
+
     // STAGE 2 one-shot interop benchmark (opt-in via cleanfg.prop interop_bench=1).
     if (info && info->swapchainCount >= 1 && g_config.interop_bench) {
         static std::atomic<bool> benchRan{false};
@@ -856,6 +862,7 @@ VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
 // elevate the panel refresh rate on the matching swapchain.
 VkResult my_CreateAndroidSurface(VkInstance inst, const VkAndroidSurfaceCreateInfoKHR* ci,
                                  const VkAllocationCallbacks* alloc, VkSurfaceKHR* out) {
+    noteVulkanCandidate();
     VkResult r = orig_CreateAndroidSurface(inst, ci, alloc, out);
     if (r == VK_SUCCESS && out && *out && ci) {
         std::lock_guard<std::mutex> lk(g_mtx);

@@ -191,3 +191,11 @@ Update the GLES capture path to prefer GLES3 `glBlitFramebuffer` from the defaul
 ### Stage 3.9: GLES adaptive blend parity with Vulkan
 
 After the GLES blit capture fix made Asphalt 8 render normally and allowed frame history to work, port the current Vulkan `blend.comp` generation logic into the GLES fullscreen fragment shader. GLES now uses the same internal generation model as Vulkan: reactive mask, composition mask, instability/current reset, directional pan blur, static sharp-detail/HUD protection, and neighborhood color clipping. This keeps the public method as `method=blend` while making the GLES visual output match the smooth Vulkan path as closely as possible.
+
+### Stage 4.0: production auto mode and sealed tuning
+
+The production configuration is now intentionally minimal: `cleanfg.prop` exposes only `target_packages`. All runtime tuning is internal and defaults to the validated single `method=blend` generation path: auto backend, 2x generation, display-rate elevation, swap-interval unlock for GLES, Vulkan present bridge, debug off, and the validated blend/reactivity constants.
+
+Auto backend selection installs both Vulkan and EGL hooks, but only the backend that actually presents frames becomes active. Vulkan surface/device/swapchain creation marks a Vulkan candidate; GLES waits briefly in auto mode so UI/EGL setup cannot steal the process from a real Vulkan renderer. The first real `vkQueuePresentKHR` selects Vulkan; otherwise `eglSwapBuffers` selects GLES. After selection, the other backend passes through without generating frames.
+
+GLES now also resets temporal history after large frame-time discontinuities and uses `eglPresentationTimeANDROID` when available to hint generated/real frame pacing at half-frame intervals.

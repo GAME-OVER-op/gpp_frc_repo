@@ -5,10 +5,36 @@
 #include <cstdlib>
 #include <string>
 #include <unistd.h>
+#include <utility>
 
 namespace cleanfg {
 
 Config g_config;
+
+static void applyInternalDefaultsKeepingTargets(std::vector<std::string>&& targets) {
+    g_config = Config{};
+    g_config.target_packages = std::move(targets);
+    // Production is intentionally self-tuning. cleanfg.prop should only carry
+    // target_packages; all legacy/tuning keys are ignored so stale configs cannot
+    // force GLES/Vulkan/debug/experimental modes or low-quality parameters.
+    g_config.mode = Mode::Auto;
+    g_config.method = Method::Blend;
+    g_config.multiplier = 2;
+    g_config.max_fps = 0;
+    g_config.elevate_rate = true;
+    g_config.force_swap_interval_0 = true;
+    g_config.present_bridge = true;
+    g_config.debug = false;
+    g_config.blend_alpha = 0.52f;
+    g_config.diff_threshold = 0.055f;
+    g_config.diff_softness = 0.18f;
+    g_config.motion_strength = 0.85f;
+    g_config.blur_radius = 1;
+    g_config.gles_debug_mode = 0;
+    g_config.interop_bench = false;
+    g_config.extrap_bench = false;
+    g_config.extrap_eval = false;
+}
 
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -30,7 +56,7 @@ bool Config::matchesPackage(const char* name) const {
 // Parse config text (in-memory). Resets g_config to defaults first so repeated
 // loads (e.g. fd fallback then file) do not accumulate duplicate targets.
 static void parseConfigText(const std::string& content) {
-    g_config = Config{};
+    std::vector<std::string> targets;
     size_t pos = 0;
     while (pos < content.size()) {
         size_t nl = content.find('\n', pos);
@@ -50,71 +76,16 @@ static void parseConfigText(const std::string& content) {
                 size_t comma = val.find(',', start);
                 std::string item = trim(val.substr(
                     start, comma == std::string::npos ? std::string::npos : comma - start));
-                if (!item.empty()) g_config.target_packages.push_back(item);
+                if (!item.empty()) targets.push_back(item);
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
-        } else if (key == "mode") {
-            if (val == "gles") g_config.mode = Mode::Gles;
-            else if (val == "vulkan") g_config.mode = Mode::Vulkan;
-            else g_config.mode = Mode::Auto;
-        } else if (key == "multiplier") {
-            g_config.multiplier = atoi(val.c_str());
-            if (g_config.multiplier < 1) g_config.multiplier = 1;
-        } else if (key == "method") {
-            // For now there is one production generation path: method=blend.
-            // Old/experimental values are intentionally folded back to Blend so
-            // a stale cleanfg.prop cannot re-enable the expensive full-res flow.
-            if (val == "extrapolate" || val == "reproject") {
-                g_config.method = Method::Extrapolate;
-            } else {
-                g_config.method = Method::Blend;
-            }
-        } else if (key == "max_fps") {
-            g_config.max_fps = atoi(val.c_str());
-            if (g_config.max_fps < 0) g_config.max_fps = 0;
-        } else if (key == "elevate_rate") {
-            g_config.elevate_rate = (val == "1" || val == "true");
-        } else if (key == "force_swap_interval_0") {
-            g_config.force_swap_interval_0 = (val == "1" || val == "true");
-        } else if (key == "present_bridge") {
-            g_config.present_bridge = (val == "1" || val == "true");
-        } else if (key == "debug") {
-            g_config.debug = (val == "1" || val == "true");
-        } else if (key == "blend_alpha") {
-            g_config.blend_alpha = (float)atof(val.c_str());
-        } else if (key == "diff_threshold") {
-            g_config.diff_threshold = (float)atof(val.c_str());
-        } else if (key == "diff_softness") {
-            g_config.diff_softness = (float)atof(val.c_str());
-        } else if (key == "motion_strength") {
-            g_config.motion_strength = (float)atof(val.c_str());
-        } else if (key == "blur_radius") {
-            g_config.blur_radius = atoi(val.c_str());
-            if (g_config.blur_radius < 0) g_config.blur_radius = 0;
-        } else if (key == "gles_debug_mode") {
-            if (val == "passthrough") g_config.gles_debug_mode = 1;
-            else if (val == "capture_only") g_config.gles_debug_mode = 2;
-            else if (val == "draw_only") g_config.gles_debug_mode = 3;
-            else if (val == "double_present") g_config.gles_debug_mode = 4;
-            else if (val == "current_only") g_config.gles_debug_mode = 5;
-            else if (val == "framegen" || val == "blend" || val.empty()) g_config.gles_debug_mode = 0;
-            else {
-                g_config.gles_debug_mode = atoi(val.c_str());
-                if (g_config.gles_debug_mode < 0 || g_config.gles_debug_mode > 5) g_config.gles_debug_mode = 0;
-            }
-        } else if (key == "interop_bench") {
-            g_config.interop_bench = (val == "1" || val == "true");
-        
-        } else if (key == "extrap_bench") {
-            g_config.extrap_bench = (val == "1" || val == "true");
-        
-        } else if (key == "extrap_eval") {
-            g_config.extrap_eval = (val == "1" || val == "true");
         }
     }
 
-    LOGI("config loaded: %zu target(s), mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
+    applyInternalDefaultsKeepingTargets(std::move(targets));
+
+    LOGI("config loaded: %zu target(s), internal mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
          g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);

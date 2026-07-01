@@ -15,19 +15,17 @@ struct Config {
     int max_fps = 0;              // 0 = auto / OS clamps to panel
     bool elevate_rate = true;     // request 120/144/etc via ANativeWindow_setFrameRate
     bool force_swap_interval_0 = true;
-    bool present_bridge = false;  // Stage 1: inject duplicate presents (frame-gen bridge)
+    bool present_bridge = true;   // inject generated midpoint presents
     bool debug = false;
     // Single system generation path: adaptive blend with current-frame
-    // reactivity and cheap motion-softening. These are kept tunable only while
-    // we tune picture quality; later they can become internal constants.
+    // reactivity and cheap motion-softening. These are internal constants now;
+    // cleanfg.prop intentionally exposes only target_packages.
     float blend_alpha = 0.52f;      // base blend on static scenes
     float diff_threshold = 0.055f;  // luma-diff motion sensitivity
     float diff_softness = 0.18f;    // smoothstep width above threshold
     float motion_strength = 0.85f;  // 0..1 how hard motion kills blend
     int blur_radius = 1;            // 0 = off; box-blur radius in motion zones
-    // GLES diagnostic modes for compatibility debugging:
-    // 0=framegen, 1=passthrough, 2=capture_only, 3=draw_only,
-    // 4=double_present, 5=current_only.
+    // Internal-only GLES diagnostic modes. Production default is framegen.
     int gles_debug_mode = 0;
     bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
     bool extrap_bench = false;      // Stage 2: run one-shot glExtrapolateTex2DQCOM probe

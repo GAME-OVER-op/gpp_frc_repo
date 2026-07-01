@@ -52,6 +52,7 @@ add_library(lybfghook SHARED
     extrap_eval.cpp
     gpp_engine.cpp
     frame_gen.cpp
+    backend_select.cpp
     config.cpp
     display_rate.cpp
 )

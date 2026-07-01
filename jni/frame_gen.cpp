@@ -347,7 +347,22 @@ void fgInitGles(int width,int height){
 }
 
 void fgCaptureCurrentGles(FrameContext& ctx){
-    int64_t n=nowNs(); if(ctx.lastPresentNs){ int64_t dt=n-ctx.lastPresentNs; ctx.avgFrameNs = ctx.avgFrameNs? (ctx.avgFrameNs*7+dt)/8 : dt; } ctx.lastPresentNs=n;
+    int64_t n=nowNs();
+    if(ctx.lastPresentNs){
+        int64_t dt=n-ctx.lastPresentNs;
+        // FSR guidance: reset temporal history on discontinuities. App pause,
+        // loading screens, surface stalls, or abrupt scene jumps should not drag
+        // stale history into the generated frame.
+        int64_t resetNs = ctx.avgFrameNs > 0 ? ctx.avgFrameNs * 6 : 250000000LL;
+        if(dt > resetNs || dt > 250000000LL){
+            ctx.hasHistory=false;
+            ctx.frameIndex=0;
+            ctx.avgFrameNs=0;
+        } else {
+            ctx.avgFrameNs = ctx.avgFrameNs? (ctx.avgFrameNs*7+dt)/8 : dt;
+        }
+    }
+    ctx.lastPresentNs=n;
     if(!g.ready) return;
     SavedGl s; saveGl(s);
     g.current = 1 - g.current;
