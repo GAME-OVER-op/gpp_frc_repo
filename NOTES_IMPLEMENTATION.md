@@ -181,3 +181,9 @@ GitHub Actions failed because `hook_egl.cpp` called `fgRenderCurrentGles(...)`, 
 ### Stage 3.7: GLES 60 FPS follow-up instrumentation
 
 After the diagnostic build produced a visible image but stayed at 60 FPS, add GLES-side instrumentation and force `eglSwapInterval(0)` from inside the first hooked `eglSwapBuffers` call as well as through the hooked `eglSwapInterval` entry point. Some GLES games set/restore swap interval before or after our install path, so forcing once from the active swap path makes the behavior explicit. The hook now logs app swap count, generated-present count, selected `gles_debug_mode`, and measured app FPS every ~120 swaps.
+
+### Stage 3.8: GLES capture fix for Asphalt 8
+
+`log5.txt` showed the image is visible, the mode is `framegen`, but `generatedPresents=0` because every capture fails with `GL_INVALID_OPERATION` (`gles capture err=0x502`). That means the interpolation path never receives valid history/current textures and cannot present extra generated frames.
+
+Update the GLES capture path to prefer GLES3 `glBlitFramebuffer` from the default framebuffer into our texture-backed FBO, with the previous `glCopyTexSubImage2D` path kept as fallback. Also reduce log spam by rate-limiting repeated capture errors and log framebuffer/capture diagnostics once.

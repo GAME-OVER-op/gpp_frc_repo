@@ -15,6 +15,8 @@ struct GlState {
     int current=0;
     bool ready=false;
     bool loggedRender=false;
+    bool loggedCaptureInfo=false;
+    uint64_t captureErrors=0;
 } g;
 
 struct SavedGl {
@@ -38,6 +40,8 @@ struct SavedGl {
 };
 
 static int64_t nowNs(){ timespec ts{}; clock_gettime(CLOCK_MONOTONIC,&ts); return (int64_t)ts.tv_sec*1000000000LL+ts.tv_nsec; }
+
+static void drainGlErrors(){ while(glGetError()!=GL_NO_ERROR){} }
 
 static GLuint compile(GLenum type,const char* src){
     GLuint s=glCreateShader(type); glShaderSource(s,1,&src,nullptr); glCompileShader(s);
@@ -132,7 +136,7 @@ void fgInitGles(int width,int height){
     SavedGl s; saveGl(s);
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(2,g.tex);
-    for(GLuint t: g.tex){ glBindTexture(GL_TEXTURE_2D,t); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE); glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr); }
+    for(GLuint t: g.tex){ glBindTexture(GL_TEXTURE_2D,t); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE); glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr); }
     glGenFramebuffers(1,&g.fbo); g.program=makeProgram();
     const float verts[] = {-1.f,-1.f, 3.f,-1.f, -1.f,3.f};
     glGenVertexArrays(1,&g.vao); glGenBuffers(1,&g.vbo); glBindVertexArray(g.vao); glBindBuffer(GL_ARRAY_BUFFER,g.vbo); glBufferData(GL_ARRAY_BUFFER,sizeof(verts),verts,GL_STATIC_DRAW); glEnableVertexAttribArray(0); glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,0,(void*)0); glBindVertexArray(0);
@@ -145,14 +149,51 @@ void fgCaptureCurrentGles(FrameContext& ctx){
     int64_t n=nowNs(); if(ctx.lastPresentNs){ int64_t dt=n-ctx.lastPresentNs; ctx.avgFrameNs = ctx.avgFrameNs? (ctx.avgFrameNs*7+dt)/8 : dt; } ctx.lastPresentNs=n;
     if(!g.ready) return;
     SavedGl s; saveGl(s);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER,0);
-    glActiveTexture(GL_TEXTURE0);
     g.current = 1 - g.current;
-    glBindTexture(GL_TEXTURE_2D,g.tex[g.current]);
-    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,g.w,g.h);
-    GLenum err=glGetError();
+
+    // Asphalt 8 on Adreno exposes the SurfaceView through a compressed/special
+    // default framebuffer. glCopyTexSubImage2D from FBO 0 can return
+    // GL_INVALID_OPERATION there. Prefer a GLES3 framebuffer blit into our
+    // texture; this also has a chance to resolve MSAA default buffers.
+    drainGlErrors();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g.fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,g.tex[g.current],0);
+    GLenum fbStatus=glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    GLenum err=GL_NO_ERROR;
+    if(fbStatus==GL_FRAMEBUFFER_COMPLETE){
+        glBlitFramebuffer(0,0,g.w,g.h,0,0,g.w,g.h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+        err=glGetError();
+    } else {
+        err=GL_INVALID_FRAMEBUFFER_OPERATION;
+    }
+
+    // Fallback to the older direct copy if blit is not accepted by the driver.
+    if(err!=GL_NO_ERROR){
+        drainGlErrors();
+        glBindFramebuffer(GL_READ_FRAMEBUFFER,0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D,g.tex[g.current]);
+        glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,g.w,g.h);
+        err=glGetError();
+    }
     restoreGl(s);
-    if(err!=GL_NO_ERROR){ if(g_config.debug) LOGW("gles capture err=0x%x",err); return; }
+
+    if(g_config.debug && !g.loggedCaptureInfo){
+        GLint rb=0, db=0, samples=0, red=0, green=0, blue=0, alpha=0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&rb);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&db);
+        glGetIntegerv(GL_SAMPLES,&samples);
+        glGetIntegerv(GL_RED_BITS,&red); glGetIntegerv(GL_GREEN_BITS,&green); glGetIntegerv(GL_BLUE_BITS,&blue); glGetIntegerv(GL_ALPHA_BITS,&alpha);
+        LOGI("gles capture path fbStatus=0x%x err=0x%x restoredReadFbo=%d restoredDrawFbo=%d samples=%d rgbaBits=%d/%d/%d/%d",
+             fbStatus,err,rb,db,samples,red,green,blue,alpha);
+        g.loggedCaptureInfo=true;
+    }
+    if(err!=GL_NO_ERROR){
+        g.captureErrors++;
+        if(g_config.debug && (g.captureErrors<=12 || (g.captureErrors%120)==0)) LOGW("gles capture err=0x%x count=%llu",err,(unsigned long long)g.captureErrors);
+        return;
+    }
     ctx.hasHistory = ctx.frameIndex > 0; ctx.frameIndex++;
 }
 
