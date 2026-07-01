@@ -187,3 +187,7 @@ After the diagnostic build produced a visible image but stayed at 60 FPS, add GL
 `log5.txt` showed the image is visible, the mode is `framegen`, but `generatedPresents=0` because every capture fails with `GL_INVALID_OPERATION` (`gles capture err=0x502`). That means the interpolation path never receives valid history/current textures and cannot present extra generated frames.
 
 Update the GLES capture path to prefer GLES3 `glBlitFramebuffer` from the default framebuffer into our texture-backed FBO, with the previous `glCopyTexSubImage2D` path kept as fallback. Also reduce log spam by rate-limiting repeated capture errors and log framebuffer/capture diagnostics once.
+
+### Stage 3.9: GLES adaptive blend parity with Vulkan
+
+After the GLES blit capture fix made Asphalt 8 render normally and allowed frame history to work, port the current Vulkan `blend.comp` generation logic into the GLES fullscreen fragment shader. GLES now uses the same internal generation model as Vulkan: reactive mask, composition mask, instability/current reset, directional pan blur, static sharp-detail/HUD protection, and neighborhood color clipping. This keeps the public method as `method=blend` while making the GLES visual output match the smooth Vulkan path as closely as possible.
