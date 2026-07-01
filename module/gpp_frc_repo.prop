@@ -1,0 +1,3 @@
+# Comma-separated Android package names that should use frame generation.
+# Keep one package while testing. Wildcard (*) is supported but not recommended.
+target_packages=com.example.game

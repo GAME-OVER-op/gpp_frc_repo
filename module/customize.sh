@@ -1,15 +1,14 @@
 #!/system/bin/sh
-# Magisk/KernelSU install script for cleanfg.
 SKIPUNZIP=0
 
-ui_print "- cleanfg: clean Zygisk frame-generation hook"
+ui_print "- gpp_frc_repo: automatic Vulkan/GLES frame generation"
+ui_print "- configure apps in gpp_frc_repo.prop"
 ui_print "- no network, no analytics"
 
-# Положить собранную .so в zygisk/<abi>.so перед упаковкой.
 if [ -d "$MODPATH/zygisk" ]; then
-  ui_print "- zygisk libraries present"
+  ui_print "- Zygisk libraries present"
 else
-  ui_print "! zygisk/ directory missing — соберите .so и положите zygisk/arm64-v8a.so"
+  ui_print "! zygisk/ directory missing"
 fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644

@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 namespace {
 struct GlState {
     int w=0,h=0;
@@ -352,10 +352,10 @@ void fgCaptureCurrentGles(FrameContext& ctx){
     SavedGl s; saveGl(s);
     g.current = 1 - g.current;
 
-    // Asphalt 8 on Adreno exposes the SurfaceView through a compressed/special
-    // default framebuffer. glCopyTexSubImage2D from FBO 0 can return
-    // GL_INVALID_OPERATION there. Prefer a GLES3 framebuffer blit into our
-    // texture; this also has a chance to resolve MSAA default buffers.
+    // Some GLES surfaces expose the default framebuffer through a special or
+    // compressed layout. glCopyTexSubImage2D from FBO 0 can fail there. Prefer
+    // a GLES3 framebuffer blit into our texture; this can also resolve MSAA
+    // default buffers before generation.
     drainGlErrors();
     glBindFramebuffer(GL_READ_FRAMEBUFFER,0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g.fbo);

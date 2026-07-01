@@ -2,7 +2,7 @@
 #include <EGL/egl.h>
 #include <cstdint>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 struct FrameContext {
     int width = 0;
     int height = 0;

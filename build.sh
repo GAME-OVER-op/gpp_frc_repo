@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Local build helper (optional). CI does this automatically via
-# .github/workflows/build.yml — you normally do NOT need to run this.
-#
-# Requirements for local builds:
-#   - Android NDK (set ANDROID_NDK to its path)
-#   - cmake + ninja
-#   - internet access (FetchContent pulls Dobby; we also fetch zygisk.hpp)
+# Local build helper. CI builds the release zip automatically, but this script is
+# useful when testing with a local Android NDK installation.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -16,16 +11,19 @@ if [ -z "${ANDROID_NDK:-}" ]; then
   exit 1
 fi
 
-# Fetch the official Zygisk header (same as CI).
 if ! grep -q 'class ModuleBase' jni/zygisk.hpp 2>/dev/null; then
   echo "Fetching official zygisk.hpp ..."
   curl -fsSL "https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp" -o jni/zygisk.hpp
   grep -q REGISTER_ZYGISK_MODULE jni/zygisk.hpp || { echo "bad zygisk.hpp"; exit 1; }
 fi
 
+if ! command -v glslangValidator >/dev/null 2>&1; then
+  echo "ERROR: glslangValidator is required to build jni/blend.comp" >&2
+  exit 1
+fi
+glslangValidator -V jni/blend.comp --vn blend_comp_spv -o jni/blend_comp.h
+
 patch_dobby() {
-  # Dobby's arm64 closure-bridge asm uses Apple Mach-O relocation syntax
-  # (@PAGE / @PAGEOFF) that the NDK ELF assembler rejects. Rewrite to ELF form.
   local src="$1"
   [ -d "$src" ] || return 0
   local f
@@ -49,9 +47,10 @@ for ABI in arm64-v8a armeabi-v7a; do
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
   patch_dobby "$BUILD_DIR/_deps/dobby-src"
   cmake --build "$BUILD_DIR" -j"$(nproc)"
-  cp "$BUILD_DIR/liblybfghook.so" "module/zygisk/$ABI.so"
+  cp "$BUILD_DIR/libgpp_frc_repo.so" "module/zygisk/$ABI.so"
+  "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "module/zygisk/$ABI.so" || true
 done
 
-rm -f cleanfg-magisk.zip
-( cd module && zip -qr ../cleanfg-magisk.zip . -x "README_INSTALL.txt" )
-echo "Done -> cleanfg-magisk.zip"
+rm -f gpp_frc_repo-magisk.zip
+( cd module && zip -qr ../gpp_frc_repo-magisk.zip . -x "README_INSTALL.txt" )
+echo "Done -> gpp_frc_repo-magisk.zip"

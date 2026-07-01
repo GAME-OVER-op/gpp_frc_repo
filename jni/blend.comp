@@ -1,5 +1,5 @@
 #version 450
-// cleanfg single generation path: adaptive temporal blend.
+// gpp_frc_repo single generation path: adaptive temporal blend.
 //
 // Fast app-side frame generation. This pass stays single-dispatch and avoids
 // full optical flow. It uses cheap FSR-inspired signals that work with only

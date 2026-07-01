@@ -7,7 +7,7 @@
 #include <EGL/egl.h>
 #include <android/native_window.h>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 extern void* hookFunction(void* target, void* replacement);
 using PFN_eglSwapBuffers = EGLBoolean (*)(EGLDisplay, EGLSurface);
 using PFN_eglSwapInterval = EGLBoolean (*)(EGLDisplay, EGLint);

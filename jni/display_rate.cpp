@@ -16,7 +16,7 @@
 #define ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS 1
 #endif
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 // ANativeWindow_setFrameRate is __INTRODUCED_IN(30); the "with change strategy"
 // variant is __INTRODUCED_IN(31). We build against android-26 and must also run on

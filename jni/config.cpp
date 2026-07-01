@@ -7,18 +7,17 @@
 #include <unistd.h>
 #include <utility>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 Config g_config;
 
 static void applyInternalDefaultsKeepingTargets(std::vector<std::string>&& targets) {
     g_config = Config{};
     g_config.target_packages = std::move(targets);
-    // Production is intentionally self-tuning. cleanfg.prop should only carry
+    // Production is intentionally self-tuning. gpp_frc_repo.prop should only carry
     // target_packages; all legacy/tuning keys are ignored so stale configs cannot
     // force GLES/Vulkan/debug/experimental modes or low-quality parameters.
     g_config.mode = Mode::Auto;
-    g_config.method = Method::Blend;
     g_config.multiplier = 2;
     g_config.max_fps = 0;
     g_config.elevate_rate = true;
@@ -31,9 +30,6 @@ static void applyInternalDefaultsKeepingTargets(std::vector<std::string>&& targe
     g_config.motion_strength = 0.85f;
     g_config.blur_radius = 1;
     g_config.gles_debug_mode = 0;
-    g_config.interop_bench = false;
-    g_config.extrap_bench = false;
-    g_config.extrap_eval = false;
 }
 
 static std::string trim(const std::string& s) {
@@ -85,17 +81,14 @@ static void parseConfigText(const std::string& content) {
 
     applyInternalDefaultsKeepingTargets(std::move(targets));
 
-    LOGI("config loaded: %zu target(s), internal mode=%d mult=%d max_fps=%d method=%d elevate=%d swap0=%d pbridge=%d debug=%d",
+    LOGI("config loaded: %zu target(s), internal mode=%d mult=%d max_fps=%d elevate=%d swap0=%d pbridge=%d debug=%d",
          g_config.target_packages.size(), (int)g_config.mode, g_config.multiplier,
-         g_config.max_fps, (int)g_config.method, g_config.elevate_rate,
+         g_config.max_fps, g_config.elevate_rate,
          g_config.force_swap_interval_0, g_config.present_bridge, g_config.debug);
     LOGI("blend params: alpha=%.3f diff_thr=%.3f diff_soft=%.3f motion=%.3f blur=%d",
          g_config.blend_alpha, g_config.diff_threshold, g_config.diff_softness,
          g_config.motion_strength, g_config.blur_radius);
     LOGI("gles_debug_mode=%d", g_config.gles_debug_mode);
-    LOGI("interop_bench=%d", g_config.interop_bench);
-    LOGI("extrap_bench=%d", g_config.extrap_bench);
-    LOGI("extrap_eval=%d", g_config.extrap_eval);
 }
 
 // Read an entire fd to EOF and parse it. Works for both a regular file fd
@@ -133,4 +126,4 @@ bool loadConfig(const char* path) {
     return true;
 }
 
-}  // namespace cleanfg
+}  // namespace gpp_frc_repo

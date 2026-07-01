@@ -1,11 +1,8 @@
-// Vulkan present path: capture the game's presented swapchain image, read it
-// back into a linear host-visible buffer, and feed it to the vendor frame-gen
-// engine (GppEngine -> libgppvppgfrcplussession.so -> vppservice).
+// Vulkan present path for gpp_frc_repo.
 //
-// STAGE 1 (this milestone): prove the engine accepts real game frames and logs
-// "FRC will do Nx interpolation". The engine output is drained off-screen for now;
-// on-screen presentation of generated frames is the next milestone.
-#include "gpp_engine.h"
+// The hook selects Vulkan automatically when real swapchain presentation is used,
+// creates a lightweight adaptive blend pass, presents one generated midpoint
+// frame, then presents the application's real frame.
 #include "config.h"
 #include "backend_select.h"
 #include "log.h"
@@ -18,12 +15,8 @@
 #include <mutex>
 #include <cstring>
 #include "blend_comp.h"  // generated at build time (glslangValidator --vn blend_comp_spv)
-#include "interop_bench.h"
-#include "extrap_bench.h"
-#include "extrap_eval.h"
-#include <atomic>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 extern void* hookFunction(void* target, void* replacement);
 
@@ -81,37 +74,16 @@ struct SwapInfo {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{};
     std::vector<VkImage> images;
-    // capture resources (lazy)
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    void* mapped = nullptr;
-    int rowBytes = 0;
-    bool capReady = false;
-    bool engineConnected = false;
     void* window = nullptr;       // ANativeWindow* captured from vkCreateAndroidSurfaceKHR
     bool rateRequested = false;
-    // present-bridge (frame injection) resources
+    // generated-present resources
+    VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer injCmd = VK_NULL_HANDLE;
     VkFence injFence = VK_NULL_HANDLE;
     VkFence acqFence = VK_NULL_HANDLE;
     bool injReady = false;
     bool injLogged = false;
-    // blend interpolation (Stage 2A): CPU midpoint of prev+cur frame
-    VkBuffer dlBuf = VK_NULL_HANDLE;   // download current frame to host
-    VkBuffer ulBuf = VK_NULL_HANDLE;   // upload blended midpoint from host
-    VkDeviceMemory dlMem = VK_NULL_HANDLE;
-    VkDeviceMemory ulMem = VK_NULL_HANDLE;
-    void* dlMapped = nullptr;
-    void* ulMapped = nullptr;
-    std::vector<uint8_t> prevFrame;
-    bool hasPrev = false;
-    int blendRowBytes = 0;
-    VkDeviceSize blendBytes = 0;
-    bool blendReady = false;
-    // --- Stage 2B: GPU compute-blend resources ---
+    // adaptive GPU blend resources
     VkImage gPrev = VK_NULL_HANDLE, gCur = VK_NULL_HANDLE, gOut = VK_NULL_HANDLE;
     VkDeviceMemory gPrevMem = VK_NULL_HANDLE, gCurMem = VK_NULL_HANDLE, gOutMem = VK_NULL_HANDLE;
     VkImageView gPrevView = VK_NULL_HANDLE, gCurView = VK_NULL_HANDLE, gOutView = VK_NULL_HANDLE;
@@ -185,7 +157,8 @@ DevFns& devFns(VkDevice dev) {
         f.phys = pit->second;
         if (pGetMemProps && f.phys) pGetMemProps(f.phys, &f.memProps);
     }
-    f.ok = f.getSwapImages && f.createPool && f.copyImgToBuf && f.submit && f.mapMem;
+    f.ok = f.getSwapImages && f.createPool && f.allocCmd && f.beginCmd && f.barrier &&
+           f.endCmd && f.submit && f.createFence && f.waitFences && f.resetFences && f.resetCmd;
     g_devs[dev] = f;
     return g_devs[dev];
 }
@@ -197,175 +170,7 @@ int findMemType(const DevFns& f, uint32_t bits, VkMemoryPropertyFlags want) {
     return -1;
 }
 
-// Lazily build capture resources (command pool/buffer/memory/fence) for a swapchain.
-bool ensureCapture(SwapInfo& sw, DevFns& f, uint32_t queueFamily) {
-    if (sw.capReady) return true;
-    int rb = (int)sw.extent.width * 4;
-    VkDeviceSize size = (VkDeviceSize)rb * sw.extent.height;
-
-    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = queueFamily;
-    if (f.createPool(sw.device, &pci, nullptr, &sw.pool) != VK_SUCCESS) { LOGE("vk: createPool fail"); return false; }
-
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = sw.pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-    if (f.allocCmd(sw.device, &cai, &sw.cmd) != VK_SUCCESS) { LOGE("vk: allocCmd fail"); return false; }
-
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    f.createFence(sw.device, &fci, nullptr, &sw.fence);
-
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = size; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (f.createBuf(sw.device, &bci, nullptr, &sw.buffer) != VK_SUCCESS) { LOGE("vk: createBuf fail"); return false; }
-    VkMemoryRequirements mr{}; f.getBufReq(sw.device, sw.buffer, &mr);
-    int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (mt < 0) { LOGE("vk: no host-visible mem type"); return false; }
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
-    if (f.allocMem(sw.device, &mai, nullptr, &sw.memory) != VK_SUCCESS) { LOGE("vk: allocMem fail"); return false; }
-    f.bindBufMem(sw.device, sw.buffer, sw.memory, 0);
-    if (f.mapMem(sw.device, sw.memory, 0, VK_WHOLE_SIZE, 0, &sw.mapped) != VK_SUCCESS) { LOGE("vk: mapMem fail"); return false; }
-    sw.rowBytes = rb;
-    sw.capReady = true;
-    LOGI("vk: capture ready %ux%u rowBytes=%d qf=%u", sw.extent.width, sw.extent.height, rb, queueFamily);
-    return true;
-}
-
-void captureAndSubmit(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageIndex) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    auto sit = g_swaps.find(swapchain);
-    if (sit == g_swaps.end()) return;
-    SwapInfo& sw = sit->second;
-    DevFns& f = devFns(sw.device);
-    if (!f.ok) return;
-    if (imageIndex >= sw.images.size()) return;
-    // queue family 0 assumed (Adreno graphics queue); iterate later if needed.
-    if (!ensureCapture(sw, f, 0)) return;
-
-    VkImage img = sw.images[imageIndex];
-    f.resetCmd(sw.cmd, 0);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    f.beginCmd(sw.cmd, &bi);
-
-    VkImageMemoryBarrier toSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.image = img;
-    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0; region.bufferRowLength = 0; region.bufferImageHeight = 0;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {0,0,0};
-    region.imageExtent = {sw.extent.width, sw.extent.height, 1};
-    f.copyImgToBuf(sw.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sw.buffer, 1, &region);
-
-    VkImageMemoryBarrier toPresent = toSrc;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toPresent.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
-    f.endCmd(sw.cmd);
-
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &sw.cmd;
-    f.resetFences(sw.device, 1, &sw.fence);
-    if (f.submit(queue, 1, &si, sw.fence) != VK_SUCCESS) return;
-    f.waitFences(sw.device, 1, &sw.fence, VK_TRUE, 100000000ULL); // 100ms
-
-    // If source is BGRA, swap into RGBA in place (engine converter expects RGBA).
-    if (isBGRA(sw.format)) {
-        uint8_t* p = (uint8_t*)sw.mapped;
-        size_t n = (size_t)sw.extent.width * sw.extent.height;
-        for (size_t i = 0; i < n; ++i) { uint8_t t = p[i*4]; p[i*4] = p[i*4+2]; p[i*4+2] = t; }
-    }
-
-    if (!sw.engineConnected) {
-        std::string pkg = g_config.target_packages.empty() ? std::string("com.miHoYo.GenshinImpact")
-                                                            : g_config.target_packages.front();
-        std::string layer = "SurfaceView[" + pkg + "]#0";
-        sw.engineConnected = g_engine.connect(pkg, layer, (int)sw.extent.width, (int)sw.extent.height);
-    }
-    if (sw.engineConnected) {
-        // Elevate the panel refresh rate so the generated (interpolated) frames
-        // have somewhere to be shown. Genshin caps at 60; request 60*multiplier
-        // (or max_fps). The OS clamps the request to a real supported panel mode.
-        if (sw.window && !sw.rateRequested) {
-            float target = g_config.max_fps > 0 ? (float)g_config.max_fps
-                                                : 60.0f * (float)g_config.multiplier;
-            requestFrameRateForWindow(sw.window, target);
-            sw.rateRequested = true;
-        }
-        g_engine.submitFrameRGBA(sw.mapped, (int)sw.extent.width, (int)sw.extent.height, sw.rowBytes);
-    }
-}
-
-// One-shot diagnostic helper: copy a swapchain image into a tightly-packed
-// host RGBA buffer (used by the extrap-eval real-frame test). Reuses the
-// capture buffer/fence. Returns false on any failure.
-bool captureToHost(VkQueue queue, VkSwapchainKHR swapchain, uint32_t imageIndex,
-                   std::vector<uint8_t>& out, uint32_t& wOut, uint32_t& hOut) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    auto sit = g_swaps.find(swapchain);
-    if (sit == g_swaps.end()) return false;
-    SwapInfo& sw = sit->second;
-    DevFns& f = devFns(sw.device);
-    if (!f.ok) return false;
-    if (imageIndex >= sw.images.size()) return false;
-    if (!ensureCapture(sw, f, 0)) return false;
-    VkImage img = sw.images[imageIndex];
-    f.resetCmd(sw.cmd, 0);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    f.beginCmd(sw.cmd, &bi);
-    VkImageMemoryBarrier toSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.image = img;
-    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {sw.extent.width, sw.extent.height, 1};
-    f.copyImgToBuf(sw.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sw.buffer, 1, &region);
-    VkImageMemoryBarrier toPresent = toSrc;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toPresent.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    f.barrier(sw.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
-    f.endCmd(sw.cmd);
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1; si.pCommandBuffers = &sw.cmd;
-    f.resetFences(sw.device, 1, &sw.fence);
-    if (f.submit(queue, 1, &si, sw.fence) != VK_SUCCESS) return false;
-    f.waitFences(sw.device, 1, &sw.fence, VK_TRUE, 200000000ULL);
-    size_t size = (size_t)sw.rowBytes * (size_t)sw.extent.height;
-    out.resize(size);
-    memcpy(out.data(), sw.mapped, size);
-    if (isBGRA(sw.format)) {
-        uint8_t* p = out.data();
-        size_t n = (size_t)sw.extent.width * (size_t)sw.extent.height;
-        for (size_t i = 0; i < n; ++i) { uint8_t t = p[i*4]; p[i*4] = p[i*4+2]; p[i*4+2] = t; }
-    }
-    wOut = sw.extent.width; hOut = sw.extent.height;
-    return true;
-}
-
-// Present-bridge Stage 1: lazily create the command buffer + fences used to
+// Generated-present bridge: lazily create the command buffer + fences used to
 // copy and re-present a frame.
 bool ensureInject(SwapInfo& sw, DevFns& f) {
     if (sw.injReady) return true;
@@ -386,41 +191,7 @@ bool ensureInject(SwapInfo& sw, DevFns& f) {
     return true;
 }
 
-// Lazily build the host-visible buffers used for CPU blend interpolation:
-// dlBuf receives the current frame (image->buffer); ulBuf holds the computed
-// midpoint (buffer->image); prevFrame keeps the previous frame on the CPU.
-bool ensureBlend(SwapInfo& sw, DevFns& f) {
-    if (sw.blendReady) return true;
-    sw.blendRowBytes = (int)sw.extent.width * 4;
-    sw.blendBytes = (VkDeviceSize)sw.blendRowBytes * sw.extent.height;
-    auto mkBuf = [&](VkBufferUsageFlags usage, VkBuffer* buf, VkDeviceMemory* mem, void** mapped) -> bool {
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = sw.blendBytes; bci.usage = usage; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (f.createBuf(sw.device, &bci, nullptr, buf) != VK_SUCCESS) return false;
-        VkMemoryRequirements mr{}; f.getBufReq(sw.device, *buf, &mr);
-        int mt = findMemType(f, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (mt < 0) return false;
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mt;
-        if (f.allocMem(sw.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
-        f.bindBufMem(sw.device, *buf, *mem, 0);
-        return f.mapMem(sw.device, *mem, 0, VK_WHOLE_SIZE, 0, mapped) == VK_SUCCESS;
-    };
-    if (!mkBuf(VK_BUFFER_USAGE_TRANSFER_DST_BIT, &sw.dlBuf, &sw.dlMem, &sw.dlMapped)) { LOGE("vk: blend dlBuf fail"); return false; }
-    if (!mkBuf(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sw.ulBuf, &sw.ulMem, &sw.ulMapped)) { LOGE("vk: blend ulBuf fail"); return false; }
-    sw.prevFrame.assign((size_t)sw.blendBytes, 0);
-    sw.hasPrev = false;
-    sw.blendReady = true;
-    LOGI("vk: blend ready %ux%u rowBytes=%d bytes=%llu", sw.extent.width, sw.extent.height,
-         sw.blendRowBytes, (unsigned long long)sw.blendBytes);
-    return true;
-}
-
-// STAGE 2A: synthesize an interpolated frame = midpoint of the previous and
-// current frame (CPU 50/50 blend) and present it BEFORE the real current
-// frame. Returns true if the app's wait semaphores were consumed by our
-// download submit (the caller must then present the real frame WITHOUT them).
-// Push-constant block fed to the GPU blend shader (layout must match blend.comp).
+// Push-constant block fed to the adaptive GPU blend shader (layout must match blend.comp).
 struct BlendPC {
     float baseAlpha;       // static-scene blend (0.5 = even)
     float diffThreshold;   // luma-diff motion sensitivity
@@ -431,13 +202,13 @@ struct BlendPC {
 
 bool ensureGpuBlend(SwapInfo& sw, DevFns& f) {
     if (sw.gpuReady) return true;
-    if (!f.createImage || !f.getImgReq || !f.bindImgMem || !f.createImageView ||
-        !f.createDescSetLayout || !f.createDescPool || !f.allocDescSets || !f.updateDescSets ||
+    if (!f.createImage || !f.getImgReq || !f.allocMem || !f.bindImgMem || f.memProps.memoryTypeCount == 0 ||
+        !f.createImageView || !f.createDescSetLayout || !f.createDescPool || !f.allocDescSets || !f.updateDescSets ||
         !f.createPipeLayout || !f.createShaderModule || !f.createComputePipelines ||
         !f.cmdBindPipeline || !f.cmdBindDescSets || !f.cmdDispatch || !f.cmdPushConst) {
         LOGE("vk: gpu-blend missing device fns"); return false;
     }
-    const VkFormat fmt = sw.format;  // matches swapchain (R8G8B8A8_UNORM = 37 on this device)
+    const VkFormat fmt = sw.format;  // matches swapchain
     auto mkImg = [&](VkImage* img, VkDeviceMemory* mem, VkImageView* view) -> bool {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;
@@ -688,7 +459,7 @@ VkResult my_CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* ci,
     }
     VkResult r = orig_CreateSwapchain(device, &mci, alloc, out);
     if (r != VK_SUCCESS && g_config.present_bridge) {
-        LOGW("vk: swapchain forced create rc=%d (minImages %u->%u); retrying original", (int)r, origMin, mci.minImageCount);
+        LOGW("vk: swapchain forced create rc=%d (minImages %u->%u); retrying app request", (int)r, origMin, mci.minImageCount);
         r = orig_CreateSwapchain(device, ci, alloc, out);
     }
     if (r == VK_SUCCESS && out && *out) {
@@ -716,83 +487,9 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
         return orig_QueuePresent(queue, info);
     }
 
-    // STAGE 2 one-shot interop benchmark (opt-in via cleanfg.prop interop_bench=1).
-    if (info && info->swapchainCount >= 1 && g_config.interop_bench) {
-        static std::atomic<bool> benchRan{false};
-        bool expected = false;
-        if (benchRan.compare_exchange_strong(expected, true)) {
-            VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
-            uint32_t bw = 0, bh = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_mtx);
-                auto sit = g_swaps.find(info->pSwapchains[0]);
-                if (sit != g_swaps.end()) {
-                    dev = sit->second.device; bw = sit->second.extent.width; bh = sit->second.extent.height;
-                    DevFns& bf = devFns(dev); phys = bf.phys;
-                }
-            }
-            if (dev != VK_NULL_HANDLE && bw && bh && pGDPA) {
-                runInteropBenchmark(dev, phys, queue, 0, bw, bh, pGDPA, 120);
-            }
-        }
-    }
-    // STAGE 2 one-shot Adreno frame-extrapolation probe (opt-in via extrap_bench=1).
-    if (info && info->swapchainCount >= 1 && g_config.extrap_bench) {
-        static std::atomic<bool> extrapRan{false};
-        bool expected = false;
-        if (extrapRan.compare_exchange_strong(expected, true)) {
-            uint32_t bw = 0, bh = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_mtx);
-                auto sit = g_swaps.find(info->pSwapchains[0]);
-                if (sit != g_swaps.end()) { bw = sit->second.extent.width; bh = sit->second.extent.height; }
-            }
-            if (bw && bh) runExtrapBenchmark(bw, bh, 120);
-        }
-    }
-    // STAGE 2 one-shot objective ME evaluation (opt-in via extrap_eval=1).
-    // Collects 3 spaced real frames, but only fires once there is real motion
-    // between them; predicts F2 from (F0,F1) and logs prediction error vs the
-    // duplicate-frame baseline. Pure logcat, no files. Skips injection meanwhile.
-    if (info && info->swapchainCount == 1 && g_config.extrap_eval) {
-        static std::atomic<int> evalDone{0};
-        static std::atomic<int> seen{0};
-        static std::vector<uint8_t> f0, f1, f2;
-        static uint32_t ew = 0, eh = 0;
-        if (!evalDone.load()) {
-            int n = seen.fetch_add(1) + 1;
-            const int kWarmup = 120, kSample = 5;
-            if (n >= kWarmup && (n % kSample) == 0) {
-                std::vector<uint8_t> cur; uint32_t w = 0, h = 0;
-                if (captureToHost(queue, info->pSwapchains[0], info->pImageIndices[0], cur, w, h)) {
-                    if (!f2.empty() && (w != ew || h != eh)) { f0.clear(); f1.clear(); f2.clear(); }
-                    ew = w; eh = h;
-                    f0 = std::move(f1); f1 = std::move(f2); f2 = std::move(cur);
-                    if (!f0.empty() && !f1.empty() && !f2.empty()) {
-                        auto mad = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-                            size_t nn = a.size() < b.size() ? a.size() : b.size();
-                            double acc = 0.0; size_t c = 0;
-                            for (size_t i = 0; i + 4 <= nn; i += 64) { int d = (int)a[i] - (int)b[i]; acc += d < 0 ? -d : d; ++c; }
-                            return c ? acc / (double)c : 0.0;
-                        };
-                        double m01 = mad(f0, f1), m12 = mad(f1, f2);
-                        if (m01 >= 2.0 && m12 >= 2.0) {
-                            LOGI("extrap-eval: 3 real frames with motion (m01=%.2f m12=%.2f %ux%u); evaluating", m01, m12, ew, eh);
-                            runExtrapEval(std::move(f0), std::move(f1), std::move(f2), ew, eh);
-                            evalDone.store(1);
-                        } else if (g_config.debug) {
-                            LOGI("extrap-eval: waiting for motion (m01=%.2f m12=%.2f)", m01, m12);
-                        }
-                    }
-                }
-            }
-            return orig_QueuePresent(queue, info);
-        }
-    }
     if (info) {
-        // STAGE 2A present-bridge: synthesize an interpolated midpoint frame
-        // (CPU blend of the previous and current frame) and present it BEFORE
-        // the real current frame, for genuinely smoother perceived motion.
+        // Synthesize an interpolated midpoint frame and present it before the
+        // real current frame.
         if (g_config.present_bridge && info->swapchainCount == 1) {
             bool consumed = injectBlend(queue, info->pSwapchains[0], info, info->pImageIndices[0]);
             if (consumed) {
@@ -801,10 +498,6 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
                 real.pWaitSemaphores = nullptr;
                 return orig_QueuePresent(queue, &real);
             }
-        } else {
-            for (uint32_t i = 0; i < info->swapchainCount; ++i) {
-                captureAndSubmit(queue, info->pSwapchains[i], info->pImageIndices[i]);
-            }
         }
     }
     return orig_QueuePresent(queue, info);
@@ -812,13 +505,9 @@ VkResult my_QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
 
 VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
                          const VkAllocationCallbacks* alloc, VkDevice* out) {
-    // STAGE 2: the game does not enable the device extensions our Vulkan<->GL
-    // interop path needs (AHB import + external semaphore fd). Without them,
-    // vkGetDeviceProcAddr returns null for those entry points even though the
-    // physical device supports them. So we append the required device
-    // extensions here, with a safe fallback: if the driver rejects the
-    // augmented list we recreate the device exactly as the game asked, so the
-    // game can never fail to boot because of us.
+    // Enable optional Android/foreign-memory extensions when the driver accepts
+    // them. The fallback recreates the device exactly as requested by the app,
+    // so startup remains safe on devices that reject the augmented list.
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     bool augmented = false;
     if (ci) {
@@ -842,9 +531,9 @@ VkResult my_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci,
             r = orig_CreateDevice(phys, &ci2, alloc, out);
             if (r == VK_SUCCESS) {
                 augmented = true;
-                LOGI("vk: device created with interop extensions enabled (%u total)", ci2.enabledExtensionCount);
+                LOGI("vk: device created with optional extensions enabled (%u total)", ci2.enabledExtensionCount);
             } else {
-                LOGW("vk: interop extensions rejected (r=%d); falling back to original device", r);
+                LOGW("vk: optional extensions rejected (r=%d); falling back to app-requested device", r);
             }
         }
     }
@@ -873,7 +562,7 @@ VkResult my_CreateAndroidSurface(VkInstance inst, const VkAndroidSurfaceCreateIn
 }
 
 // --- Interceptor for vkGet*ProcAddr ---------------------------------------
-// Unity/Genshin resolves Vulkan entry points through vkGetInstanceProcAddr /
+// Some engines resolve Vulkan entry points through vkGetInstanceProcAddr /
 // vkGetDeviceProcAddr and calls the driver dispatch directly, bypassing the
 // exported libvulkan.so symbols (which is why hooking the exported
 // vkQueuePresentKHR/vkCreateSwapchainKHR was inert). So we hook the two
@@ -965,4 +654,4 @@ bool installVulkanHook() {
     return any;
 }
 
-}  // namespace cleanfg
+}  // namespace gpp_frc_repo

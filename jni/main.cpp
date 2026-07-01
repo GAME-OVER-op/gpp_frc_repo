@@ -1,5 +1,4 @@
-// Zygisk entrypoint. Реализует zygisk_module_entry / zygisk_companion_entry,
-// как в оригинальном liblybfghook.so, но без сети.
+// Zygisk entrypoint for gpp_frc_repo.
 #include <sys/types.h>   // dev_t / ino_t, required by zygisk.hpp
 #include "zygisk.hpp"
 #include "config.h"
@@ -9,19 +8,18 @@
 #include <cstring>
 #include <cerrno>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 bool installEglHook();
 bool installVulkanHook();
 }
 
-using namespace cleanfg;
+using namespace gpp_frc_repo;
 
-// Module id is "cleanfg" (see module.prop), so Magisk installs files to
-// /data/adb/modules/cleanfg/. The config lives next to the module.
-static const char* kConfigPath = "/data/adb/modules/cleanfg/cleanfg.prop";
-static const char* kConfigName = "cleanfg.prop";
+// Module id is "gpp_frc_repo"; the config lives next to the module.
+static const char* kConfigPath = "/data/adb/modules/gpp_frc_repo/gpp_frc_repo.prop";
+static const char* kConfigName = "gpp_frc_repo.prop";
 
-class CleanFgModule : public zygisk::ModuleBase {
+class GppFrcRepoModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
@@ -65,7 +63,7 @@ public:
         const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
         targetProcess = g_config.matchesPackage(pkg);
         if (pkg) {
-            if (targetProcess) LOGI("cleanfg target matched: %s", pkg);
+            if (targetProcess) LOGI("gpp_frc_repo target matched: %s", pkg);
             env->ReleaseStringUTFChars(args->nice_name, pkg);
         }
 
@@ -77,7 +75,7 @@ public:
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
         if (!targetProcess) return;
-        LOGI("cleanfg active in target process");
+        LOGI("gpp_frc_repo active in target process");
 
         bool ok = false;
         switch (g_config.mode) {
@@ -116,5 +114,5 @@ static void companionHandler(int fd) {
     fclose(f);
 }
 
-REGISTER_ZYGISK_MODULE(CleanFgModule)
+REGISTER_ZYGISK_MODULE(GppFrcRepoModule)
 REGISTER_ZYGISK_COMPANION(companionHandler)

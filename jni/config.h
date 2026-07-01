@@ -2,15 +2,12 @@
 #include <string>
 #include <vector>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 enum class Mode { Auto, Gles, Vulkan };
-enum class Method { Blend, Extrapolate };
-
 struct Config {
     std::vector<std::string> target_packages;
     Mode mode = Mode::Auto;
-    Method method = Method::Blend;
     int multiplier = 2;
     int max_fps = 0;              // 0 = auto / OS clamps to panel
     bool elevate_rate = true;     // request 120/144/etc via ANativeWindow_setFrameRate
@@ -19,7 +16,7 @@ struct Config {
     bool debug = false;
     // Single system generation path: adaptive blend with current-frame
     // reactivity and cheap motion-softening. These are internal constants now;
-    // cleanfg.prop intentionally exposes only target_packages.
+    // gpp_frc_repo.prop intentionally exposes only target_packages.
     float blend_alpha = 0.52f;      // base blend on static scenes
     float diff_threshold = 0.055f;  // luma-diff motion sensitivity
     float diff_softness = 0.18f;    // smoothstep width above threshold
@@ -27,9 +24,6 @@ struct Config {
     int blur_radius = 1;            // 0 = off; box-blur radius in motion zones
     // Internal-only GLES diagnostic modes. Production default is framegen.
     int gles_debug_mode = 0;
-    bool interop_bench = false;     // Stage 2: run one-shot Vulkan<->GL interop benchmark
-    bool extrap_bench = false;      // Stage 2: run one-shot glExtrapolateTex2DQCOM probe
-    bool extrap_eval = false;       // Stage 2: objective ME prediction eval (logcat only)
     bool matchesPackage(const char* name) const;
 };
 

@@ -5,7 +5,7 @@
 #include "log.h"
 #include <mutex>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 #if defined(USE_SHADOWHOOK)
 #include "shadowhook.h"
@@ -42,4 +42,4 @@ void* hookFunction(void* target, void* replacement) {
 }
 #endif
 
-}  // namespace cleanfg
+}  // namespace gpp_frc_repo

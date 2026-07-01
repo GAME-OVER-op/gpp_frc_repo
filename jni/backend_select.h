@@ -1,6 +1,6 @@
 #pragma once
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 
 enum class RuntimeBackend {
     Unknown = 0,

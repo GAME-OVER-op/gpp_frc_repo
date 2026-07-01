@@ -4,7 +4,7 @@
 #include <atomic>
 #include <time.h>
 
-namespace cleanfg {
+namespace gpp_frc_repo {
 namespace {
 
 std::atomic<int> g_backend{(int)RuntimeBackend::Unknown};
@@ -78,4 +78,4 @@ bool tryActivateBackend(RuntimeBackend backend, const char* reason) {
     return expected == desired;
 }
 
-} // namespace cleanfg
+} // namespace gpp_frc_repo

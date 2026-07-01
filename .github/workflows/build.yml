@@ -1,4 +1,4 @@
-name: Build cleanfg Magisk module
+name: Build gpp_frc_repo Magisk module
 
 on:
   push:
@@ -100,7 +100,7 @@ jobs:
             # 3) Build.
             cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 
-            cp "$BUILD_DIR/liblybfghook.so" "module/zygisk/$ABI.so"
+            cp "$BUILD_DIR/libgpp_frc_repo.so" "module/zygisk/$ABI.so"
             "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "module/zygisk/$ABI.so" || true
           done
           ls -la module/zygisk
@@ -108,17 +108,17 @@ jobs:
       - name: Package Magisk module zip
         run: |
           set -eux
-          rm -f cleanfg-magisk.zip
+          rm -f gpp_frc_repo-magisk.zip
           cd module
-          zip -qr ../cleanfg-magisk.zip . -x "README_INSTALL.txt"
+          zip -qr ../gpp_frc_repo-magisk.zip . -x "README_INSTALL.txt"
           cd ..
-          unzip -l cleanfg-magisk.zip
+          unzip -l gpp_frc_repo-magisk.zip
 
       - name: Upload Magisk module artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cleanfg-magisk
-          path: cleanfg-magisk.zip
+          name: gpp_frc_repo-magisk
+          path: gpp_frc_repo-magisk.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -126,4 +126,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: cleanfg-magisk.zip
+          files: gpp_frc_repo-magisk.zip
