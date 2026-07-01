@@ -203,3 +203,7 @@ GLES now also resets temporal history after large frame-time discontinuities and
 ### Stage 4.1: stabilize 120 Hz production target
 
 The first production auto build could request 60/72/90 Hz when measured app FPS dipped during GLES capture/generation. That made Asphalt oscillate between 60-90 instead of holding the display at the intended 120 Hz target. For the production 2x path, keep the display request pinned to 120 Hz whenever the measured game loop is at least ~24 FPS and max_fps is automatic. Android still clamps to the actual supported panel mode.
+
+### Stage 4.2: rollback GLES presentation pacing/reset regression
+
+The auto production build improved image quality but caused Asphalt 8 to oscillate around 60-90 FPS. The likely culprit was the added GLES presentation timestamp hints and aggressive frame-time/history reset, which can make SurfaceFlinger drop/merge generated frames during rapid image changes. Roll back `eglPresentationTimeANDROID` usage and the frame-time discontinuity history reset while keeping the validated Vulkan-like GLES blend, auto backend selection, minimal `target_packages` config, and stable 120 Hz display request.

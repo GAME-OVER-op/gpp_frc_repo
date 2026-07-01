@@ -5,9 +5,7 @@
 #include "log.h"
 #include <dlfcn.h>
 #include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <android/native_window.h>
-#include <time.h>
 
 namespace cleanfg {
 extern void* hookFunction(void* target, void* replacement);
@@ -15,12 +13,10 @@ using PFN_eglSwapBuffers = EGLBoolean (*)(EGLDisplay, EGLSurface);
 using PFN_eglSwapInterval = EGLBoolean (*)(EGLDisplay, EGLint);
 using PFN_eglCreateWindowSurface = EGLSurface (*)(EGLDisplay,EGLConfig,EGLNativeWindowType,const EGLint*);
 using PFN_eglDestroySurface = EGLBoolean (*)(EGLDisplay,EGLSurface);
-using PFN_eglPresentationTimeANDROID = EGLBoolean (*)(EGLDisplay,EGLSurface,EGLnsecsANDROID);
 static PFN_eglSwapBuffers orig_eglSwapBuffers=nullptr;
 static PFN_eglSwapInterval orig_eglSwapInterval=nullptr;
 static PFN_eglCreateWindowSurface orig_eglCreateWindowSurface=nullptr;
 static PFN_eglDestroySurface orig_eglDestroySurface=nullptr;
-static PFN_eglPresentationTimeANDROID p_eglPresentationTimeANDROID=nullptr;
 static FrameContext g_ctx;
 static bool g_inited=false;
 static bool g_inside=false;
@@ -28,12 +24,6 @@ static bool g_loggedMode=false;
 static bool g_forcedSwap0=false;
 static uint64_t g_swapCalls=0;
 static uint64_t g_generatedPresents=0;
-
-static int64_t nowNs(){ timespec ts{}; clock_gettime(CLOCK_MONOTONIC,&ts); return (int64_t)ts.tv_sec*1000000000LL+ts.tv_nsec; }
-
-static void setPresentationTimeHint(EGLDisplay dpy,EGLSurface surface,int64_t ns){
-    if(p_eglPresentationTimeANDROID && ns>0) p_eglPresentationTimeANDROID(dpy,surface,(EGLnsecsANDROID)ns);
-}
 
 static EGLSurface my_eglCreateWindowSurface(EGLDisplay d,EGLConfig c,EGLNativeWindowType win,const EGLint* attr){
     EGLSurface s=orig_eglCreateWindowSurface(d,c,win,attr);
@@ -86,12 +76,9 @@ static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
     } else if(g_config.gles_debug_mode==5){
         fgRenderCurrentGles(g_ctx);
     } else if(g_config.multiplier>=2 && fgRenderGeneratedGles(g_ctx)){
-        int64_t n=nowNs();
-        if(g_ctx.avgFrameNs>0) setPresentationTimeHint(dpy,surface,n + g_ctx.avgFrameNs/2);
         orig_eglSwapBuffers(dpy,surface);
         g_generatedPresents++;
         fgRenderCurrentGles(g_ctx);
-        if(g_ctx.avgFrameNs>0) setPresentationTimeHint(dpy,surface,n + g_ctx.avgFrameNs);
     }
     if(g_config.debug && (g_swapCalls==1 || (g_swapCalls % 120)==0)){
         LOGI("gles stats mode=%d appSwaps=%llu generatedPresents=%llu measuredFps=%.1f",
@@ -106,9 +93,6 @@ static EGLBoolean my_eglSwapBuffers(EGLDisplay dpy,EGLSurface surface){
 
 bool installEglHook(){
     void* libegl=dlopen("libEGL.so",RTLD_NOW|RTLD_GLOBAL); if(!libegl){LOGE("dlopen libEGL.so failed: %s",dlerror()); return false;}
-    using PFN_eglGetProcAddress = void* (*)(const char*);
-    auto getProc=(PFN_eglGetProcAddress)dlsym(libegl,"eglGetProcAddress");
-    if(getProc) p_eglPresentationTimeANDROID=(PFN_eglPresentationTimeANDROID)getProc("eglPresentationTimeANDROID");
     void* swap=dlsym(libegl,"eglSwapBuffers"); if(!swap){LOGE("dlsym eglSwapBuffers failed"); return false;}
     void* tramp=hookFunction(swap,(void*)my_eglSwapBuffers); if(!tramp){LOGE("hook eglSwapBuffers failed"); return false;} orig_eglSwapBuffers=(PFN_eglSwapBuffers)tramp;
     if(void* p=dlsym(libegl,"eglCreateWindowSurface")){ if(void* t=hookFunction(p,(void*)my_eglCreateWindowSurface)) orig_eglCreateWindowSurface=(PFN_eglCreateWindowSurface)t; }
